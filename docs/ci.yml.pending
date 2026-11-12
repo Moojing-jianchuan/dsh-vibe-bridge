@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  client-half:
+    # The client bundle is a self-contained module-loader factory: it runs under
+    # a stubbed window/require, so this job needs no DSH installation.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: client bundle contract
+        run: node test/client-smoke.mjs
+
+  sources:
+    # Host half imports @deepseek-ai/*, which only exist inside a DSH install, so
+    # this job checks what it can without one: syntax of every shipped module and
+    # that the declared peer dependencies cover the imports.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: syntax check (every shipped .js/.mjs)
+        run: |
+          set -euo pipefail
+          for file in lib/*.js tools/*.mjs test/*.mjs; do
+            node --check "$file"
+          done
+      - name: declared peer dependencies cover the host imports
+        run: node tools/check-peer-deps.mjs
+
+  patch-applies:
+    # The optional sidebar enhancement is a diff against DSH source. This job
+    # proves the diff still parses and applies to the pinned upstream tag.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: fetch the pinned DSH tag
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch dsh-v0.2.1-rc.5 \
+            https://github.com/deepseek-ai/deepseek-harness.git dsh
+      - name: apply the source patch
+        run: |
+          set -euo pipefail
+          cd dsh
+          git apply --check -p1 ../tools/source-patch/nested-sessions.patch
+          git apply -p1 ../tools/source-patch/nested-sessions.patch
+          grep -q CHILD_ROWS_KEY_PREFIX packages/client/ui-workspace/src/client/tree.ts

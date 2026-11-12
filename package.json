@@ -1,0 +1,59 @@
+{
+  "name": "dsh-vibe-bridge",
+  "version": "0.7.0",
+  "type": "module",
+  "description": "DSH plugin: turn-cadence prompt nudges, parent/child sessions, cross-session messaging, and a nested subagent session tree in the sidebar.",
+  "license": "MIT",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json",
+    "./nudge.md": "./nudge.md"
+  },
+  "files": [
+    "lib",
+    "nudge.md",
+    "README.md",
+    "README.zh.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-layout"
+      ]
+    }
+  },
+  "scripts": {
+    "test": "node test/smoke.mjs && node test/client-smoke.mjs",
+    "test:wake-state": "node test/wake-state-probe.mjs",
+    "dev:link": "node tools/dev-link.mjs",
+    "install:plugin": "node tools/install.mjs",
+    "install:bundle": "node tools/install-bundle.mjs",
+    "check:peer-deps": "node tools/check-peer-deps.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-brand": "*",
+    "@deepseek-ai/dsh-llm": "*",
+    "@deepseek-ai/dsh-subagent": "*",
+    "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/schemastery": "*"
+  },
+  "engines": {
+    "node": ">=22.19"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "subagent",
+    "session-tree"
+  ]
+}

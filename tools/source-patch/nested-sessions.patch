@@ -1,0 +1,1638 @@
+diff --git a/packages/client/ui-workspace/src/client/locales.ts b/packages/client/ui-workspace/src/client/locales.ts
+index 0214ab9..708bc11 100644
+--- a/packages/client/ui-workspace/src/client/locales.ts
++++ b/packages/client/ui-workspace/src/client/locales.ts
+@@ -68,6 +68,8 @@ export const zh = {
+   'toast.sessionIdCopyFailed': '复制失败，请重试',
+   'row.archived': '已归档',
+   'row.pinned': '已置顶',
++  /** 折叠父会话子行的按钮可访问名；`{count}` 是子会话数。 */
++  'row.toggleChildren': '收起/展开 {count} 个子会话',
+   'toast.archivedNotOpenable': '已归档对话暂时无法查看，请取消归档后查看',
+   'toast.archived': '会话已归档，可',
+   'toast.stoppedAndArchived': '已停止并归档，可',
+@@ -194,6 +196,8 @@ export const en = {
+   'toast.sessionIdCopyFailed': 'Copy failed. Try again.',
+   'row.archived': 'Archived',
+   'row.pinned': 'Pinned',
++  /** Accessible name of the fold toggle on a parent row; `count` child Sessions. */
++  'row.toggleChildren': 'Toggle {count} child session(s)',
+   'toast.archivedNotOpenable': 'Archived sessions cannot be opened. Unarchive it to view.',
+   'toast.archived': 'Session archived. You can ',
+   'toast.stoppedAndArchived': 'Session stopped and archived. You can ',
+diff --git a/packages/client/ui-workspace/src/client/rows/Rows.module.css b/packages/client/ui-workspace/src/client/rows/Rows.module.css
+index 6d35a23..3a61c4f 100644
+--- a/packages/client/ui-workspace/src/client/rows/Rows.module.css
++++ b/packages/client/ui-workspace/src/client/rows/Rows.module.css
+@@ -112,6 +112,38 @@
+   gap: 0;
+ }
+ 
++/* Subagent child rows nest one step past their parent: the group section
++   publishes --dsh-workspace-indent for its own tree level, so a child adds its
++   own 22px step instead of replacing the group's. */
++.sessionRow[data-depth='1'] {
++  padding-inline-start: calc(8px + var(--dsh-workspace-indent, 0px) + 22px);
++}
++
++/* Fold toggle for a parent Session's child rows. It takes its own 12px cell
++   immediately before the title, so a parent with child rows reads one step
++   further in than a parent without them; the status slot and the trailing
++   cells keep their columns. */
++.childToggle {
++  flex: none;
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  width: 12px;
++  height: 20px;
++  padding: 0;
++  border: none;
++  border-radius: var(--dsw-radius-xs);
++  background: transparent;
++  cursor: pointer;
++  color: var(--dsw-alias-label-tertiary);
++  font-size: 10px;
++  line-height: 1;
++}
++
++.childToggle:hover {
++  color: var(--dsw-alias-label-primary);
++}
++
+ .sessionRow .title {
+   margin: 0 6px 0 4px;
+ }
+diff --git a/packages/client/ui-workspace/src/client/rows/Rows.tsx b/packages/client/ui-workspace/src/client/rows/Rows.tsx
+index 216a6fc..6b135a6 100644
+--- a/packages/client/ui-workspace/src/client/rows/Rows.tsx
++++ b/packages/client/ui-workspace/src/client/rows/Rows.tsx
+@@ -334,6 +334,39 @@ function assertNever(value: never): never {
+   throw new Error(`unknown pending interaction: ${String(value)}`)
+ }
+ 
++/**
++ * Fold toggle for a Session's subagent child rows: the row owns the button, so
++ * the click never reaches the row's own open handler, and the reported target
++ * state is the opposite of the fold the derivation just rendered.
++ * @param props.node - derived parent row carrying its catalog size and fold state.
++ * @param props.onToggle - persist the next fold state for this parent.
++ * @param props.t - the browser root's locale seat, for the accessible name.
++ * @returns the toggle button, or null while the parent has no child rows.
++ */
++function ChildRowsToggle({ node, onToggle, t }: {
++  node: SessionNode
++  onToggle: ((sessionId: SessionNode['id'], expanded: boolean) => void) | undefined
++  t: RowTranslate
++}) {
++  const count = node.childCount ?? 0
++  if (count === 0) return null
++  const expanded = node.childExpanded !== false
++  return (
++    <button
++      type="button"
++      className={css.childToggle}
++      aria-label={t('row.toggleChildren', { count })}
++      aria-expanded={expanded}
++      onClick={(e) => {
++        e.stopPropagation()
++        onToggle?.(node.id, !expanded)
++      }}
++    >
++      {expanded ? '\u25BE' : '\u25B8'}
++    </button>
++  )
++}
++
+ interface SessionStatus {
+   state: StateDotState
+   label: string
+@@ -523,13 +556,14 @@ export function SearchResultItem({ result, currentId, onOpen, onUnarchive, t }:
+ }
+ 
+ /**
+- * One top-level 32px session row: leading 16px cell (status dot, or the
++ * One 32px session row — a top-level row, or a parent's indented subagent
++ * child row below it: leading 16px cell (status dot, or the
+  * leading seat while the row's primary state is idle), title, relative time or
+  * compact pending label, and the row actions menu. A row that owns a state dot
+  * keeps that cell and renders no seat, so an ambient automation mark never
+  * appears beside the row's own state dot. An archived row keeps the cell blank:
+  * neither marker renders there, and its live status stays on the hover card.
+- * @param props.node - derived session node.
++ * @param props.node - derived session node; its `depth` drives the child-row indent step.
+  * @param props.currentId - selected session id (row highlight).
+  * @param props.now - epoch ms for relative-time formatting.
+  * @param props.onOpen - open a session by id.
+@@ -538,12 +572,13 @@ export function SearchResultItem({ result, currentId, onOpen, onUnarchive, t }:
+  * (`sidebar.workspaces.session.menu.item` / `sidebar.workspaces.session.row.action`),
+  * its leading decoration, and its hover-card section.
+  * @param props.onReveal - scroll this row into view after search navigation, then acknowledge it.
+- * @param props.drag - optional row-drag target wiring; blank rows cannot start a drag.
++ * @param props.onToggleChildRows - persist a parent row's next child-row fold state.
++ * @param props.drag - optional row-drag target wiring; blank and child rows cannot start a drag.
+  * @param props.t - the browser root's locale seat.
+  * @returns the session row.
+  */
+ export function SessionNodeItem({
+-  node, currentId, now, onOpen, onRenameRequest, renderSlot, onReveal, drag, t,
++  node, currentId, now, onOpen, onRenameRequest, renderSlot, onReveal, onToggleChildRows, drag, t,
+ }: {
+   node: SessionNode
+   currentId: string | undefined
+@@ -553,6 +588,8 @@ export function SessionNodeItem({
+   onRenameRequest: (id: SessionNode['id'], currentTitle: string) => void
+   /** Scroll this row into view after search navigation, then acknowledge it. */
+   onReveal?: (() => void) | undefined
++  /** Persist a parent row's next child-row fold state; absent when nothing owns the fold store. */
++  onToggleChildRows?: ((id: SessionNode['id'], expanded: boolean) => void) | undefined
+   /** Present on reorderable-list rows so every row can remain a drop target. */
+   drag?: RowDragProps | undefined
+   t: RowTranslate
+@@ -570,8 +607,9 @@ export function SessionNodeItem({
+   const showStatus = primaryStatus.state !== 'idle'
+   // Archived rows hold their in-place grayed slot, so manual reorder cannot
+   // move them. Pinned rows drag within the pinned block: the browser gates
+-  // their drop targets to fellow pinned rows.
+-  const draggable = drag !== undefined && !row.blank && !row.archived
++  // their drop targets to fellow pinned rows. A subagent child row belongs to
++  // its parent's position and is placed by the catalog, so it never drags.
++  const draggable = drag !== undefined && !row.blank && !row.archived && row.childOf === undefined
+   const [menuOpen, setMenuOpen] = useState(false)
+   // The menu's open state, bound into the row entries' `useMenuOpenState` hook.
+   const menuOpenState = useMemo((): MenuOpenState => [menuOpen, setMenuOpen], [menuOpen])
+@@ -588,6 +626,7 @@ export function SessionNodeItem({
+     <div
+       ref={rowRef}
+       data-row-key={`session:${node.id}`}
++      data-depth={node.depth}
+       className={clsx(
+         css.sessionRow, selected && css.selected, menuOpen && css.menuOpen,
+         row.archived && css.archived,
+@@ -634,10 +673,11 @@ export function SessionNodeItem({
+           ? <SessionStatusDots statuses={statuses} />
+           : renderSlot('sidebar.session.row.leading', { sessionId: node.id }))}
+       </span>
++      <ChildRowsToggle node={node} onToggle={onToggleChildRows} t={t} />
+       <span
+         ref={titleRef}
+         className={css.title}
+-        onDoubleClick={row.blank
++        onDoubleClick={row.blank || row.childOf !== undefined
+           ? undefined
+           : (e) => { e.stopPropagation(); onRenameRequest(node.id, row.title) }}
+       >
+@@ -660,8 +700,10 @@ export function SessionNodeItem({
+       {row.pinned && !row.archived && <PinnedIndicator t={t} />}
+       {/* The strip's clicks stay in the strip: the trigger and every
+           row.action entry act without also opening the row, so an entry's
+-          button needs no propagation handling of its own. */}
+-      {!row.blank && (
++          button needs no propagation handling of its own. A child row carries
++          no menu: pin, archive, and fork act on the parent's slot and order,
++          which the catalog owns, and its title gesture is suppressed above. */}
++      {!row.blank && row.childOf === undefined && (
+         <span className={css.rowActions} onClick={(e) => { e.stopPropagation() }}>
+           <Menu
+             open={menuOpen}
+@@ -688,6 +730,15 @@ export function SessionNodeItem({
+           {renderSlot('sidebar.workspaces.session.row.action', { sessionId: node.id, displayTitle: row.title })}
+         </span>
+       )}
++      {/* An archived child row keeps the hover strip: restoring it is the only
++          action that applies, and the archived-only view is where those rows
++          become reachable again. The menu stays closed for child rows, so the
++          rename, pin, and fork entries never target them. */}
++      {!row.blank && row.childOf !== undefined && row.archived && (
++        <span className={css.rowActions} onClick={(e) => { e.stopPropagation() }}>
++          {renderSlot('sidebar.workspaces.session.row.action', { sessionId: node.id, displayTitle: row.title })}
++        </span>
++      )}
+     </div>
+   )
+   return (
+diff --git a/packages/client/ui-workspace/src/client/rows/WorkspaceBrowser.tsx b/packages/client/ui-workspace/src/client/rows/WorkspaceBrowser.tsx
+index df87165..461721a 100644
+--- a/packages/client/ui-workspace/src/client/rows/WorkspaceBrowser.tsx
++++ b/packages/client/ui-workspace/src/client/rows/WorkspaceBrowser.tsx
+@@ -33,8 +33,8 @@ import type { PropsRenderSlots } from '@deepseek-ai/dsh-client-ui-slots'
+ import type { WorkspaceBrowserProps } from '../contract/slots.ts'
+ import type { ArchivedFilter, GroupNode, SessionNode, SessionOrderBy, SessionRowState } from '../tree.ts'
+ import {
+-  deriveFlat, deriveGroups, deriveSearchResults, orderByRecency, owningGroupKey, owningParentFolder,
+-  pinCurrentBlank, reconcileManualOrder, sessionMemberIds, UNGROUPED_KEY,
++  childParentOf, childRowsKey, deriveFlat, deriveGroups, deriveSearchResults, orderByRecency, owningGroupKey,
++  owningParentFolder, pinCurrentBlank, reconcileManualOrder, sessionMemberIds, UNGROUPED_KEY,
+ } from '../tree.ts'
+ import { ProjectRowItem, SearchResultItem, SessionNodeItem } from './Rows.tsx'
+ import { AnimatedRows } from './AnimatedRows.tsx'
+@@ -56,37 +56,63 @@ const SESSION_WATERMARK_BASE = 5
+ /** Highest watermark that attention-bearing Sessions raise automatically; Show more and search reveals may exceed it. */
+ const SESSION_WATERMARK_AUTO_MAX = 50
+ 
+-/** Show the blank row plus the first `watermark` non-blank rows, in list order. */
++/**
++ * Show the blank row plus the first `watermark` non-blank top-level rows, in
++ * list order. A subagent child row belongs to its parent's slot rather than to
++ * its own: it renders while that parent renders, and it neither consumes a
++ * watermark slot nor counts as a hidden row for the "show more" control.
++ */
+ function watermarkRows(sessions: readonly SessionNode[], watermark: number): {
+   rows: readonly SessionNode[]
+   hiddenCount: number
+ } {
+   let count = 0
++  let hiddenCount = 0
++  // Id of the last kept top-level row; a child row renders only while its
++  // parent is that row, which keeps a hidden parent's children hidden too.
++  let keptId: SessionId | undefined
+   const rows = sessions.filter((session) => {
+-    if (session.blank) return true
++    if (session.childOf !== undefined) return session.childOf === keptId
++    if (session.blank) {
++      keptId = session.id
++      return true
++    }
+     count += 1
+-    return count <= watermark
++    if (count > watermark) {
++      hiddenCount += 1
++      keptId = undefined
++      return false
++    }
++    keptId = session.id
++    return true
+   })
+-  return { rows, hiddenCount: sessions.length - rows.length }
++  return { rows, hiddenCount }
+ }
+ 
+ /**
+- * Smallest watermark that covers every non-blank row within the automatic maximum that is running, has a running
+- * child, awaits the user, carries an unread completion, or is current, and the reveal target at any position.
++ * Smallest watermark that covers every non-blank top-level row within the
++ * automatic maximum that is running, has a running child, awaits the user,
++ * carries an unread completion, or is current, and the reveal target at any
++ * position. Child rows hold no slot, so they never raise the watermark.
+  */
+ function requiredWatermark(
+   sessions: readonly SessionNode[],
+   current: SessionId | undefined,
+   revealSessionId: SessionId | undefined,
++  parentOfCurrent: SessionId | undefined,
+ ): number {
++  // A selected child row lives under its parent's slot, so the parent counts as
++  // an attention target: without it the watermark could hide the row the
++  // browser is showing, child included. The parent comes from the catalog
++  // rather than the derived rows, which omit a folded parent's children.
+   let index = 0
+   let required = 0
+   for (const session of sessions) {
+-    if (session.blank) continue
++    if (session.blank || session.childOf !== undefined) continue
+     index += 1
+     const attention = index <= SESSION_WATERMARK_AUTO_MAX && (
+       session.running || session.runningSubagentCount > 0 || session.pendingInteraction !== undefined
+-      || session.completed || session.id === current
++      || session.completed || session.id === current || session.id === parentOfCurrent
+     )
+     if (attention || session.id === revealSessionId) required = index
+   }
+@@ -277,7 +303,7 @@ type SessionTreeProps = Pick<
+   nestWorkspaces: boolean
+   /** Explicit persisted group expansion, including descendants in tree mode. */
+   groupExpansion: Readonly<Record<string, boolean>>
+-  /** Persist one Workspace group's expansion. */
++  /** Persist one Workspace group's expansion, or one parent's child-row fold under its `session:` key. */
+   setGroupExpanded: (key: string, expanded: boolean) => void
+   /** Save a drag order and select Manual. */
+   setSessionOrder: (accountKey: string, order: readonly string[]) => void
+@@ -376,8 +402,9 @@ function SessionTree({
+     () => deriveGroups(list, workspaces, rowState, statuses, {
+       expandedGroups,
+       ungroupedOrder: ungroupedSessionIds,
++      groupExpansion,
+     }),
+-    [list, workspaces, rowState, statuses, expandedGroups, ungroupedSessionIds],
++    [list, workspaces, rowState, statuses, expandedGroups, groupExpansion, ungroupedSessionIds],
+   )
+   useEffect(() => {
+     for (let key = revealGroup; key !== undefined; key = parents.get(key)) {
+@@ -386,10 +413,12 @@ function SessionTree({
+       }
+     }
+   }, [groupExpansion, parents, revealGroup, setGroupExpanded])
++  const parentOfCurrent = current === undefined ? undefined : childParentOf(list, current)
+   const baselines = new Map(groups.map(group => [group.key, Math.max(SESSION_WATERMARK_BASE, requiredWatermark(
+     group.sessions,
+     current,
+     group.key === revealGroup ? revealSessionId : undefined,
++    parentOfCurrent,
+   ))]))
+   const foldedKeys = new Set(groups.filter(group => !group.expanded).map(group => group.key))
+   const underFoldedAncestor = (key: string): boolean => {
+@@ -415,6 +444,9 @@ function SessionTree({
+     return false
+   }
+   const now = Date.now()
++  const toggleChildRows = (sessionId: SessionId, expanded: boolean): void => {
++    setGroupExpanded(childRowsKey(sessionId), expanded)
++  }
+   const commitSessionDrag = (activeDrag: DragState, over: NonNullable<DragState['over']>): void => {
+     if (sessionDropCommitted.current) return
+     sessionDropCommitted.current = true
+@@ -591,7 +623,9 @@ function SessionTree({
+         )}
+         {sessions.map((node) => {
+         // Session drag never leaves its browser-local account, and pinned
+-        // rows reorder only within their leading pinned block.
++        // rows reorder only within their leading pinned block. A subagent
++        // child row is placed by its parent's catalog rather than by the
++        // account order, so it takes no drag wiring at all.
+           const sameGroupDrag = drag !== null && drag.accountKey === group.key
+           const compatibleTarget = sameGroupDrag && drag.pinned === node.pinned
+           const normalizeHalf = (half: 'before' | 'after'): 'before' | 'after' =>
+@@ -632,7 +666,8 @@ function SessionTree({
+               onReveal={node.id === revealSessionId && group.key === revealGroup
+                 ? () => { onSessionRevealed(node.id) }
+                 : undefined}
+-              drag={dragProps}
++              onToggleChildRows={toggleChildRows}
++              drag={node.childOf === undefined ? dragProps : undefined}
+               t={t}
+             />
+           )
+@@ -685,10 +720,15 @@ function SessionTree({
+   )
+ }
+ 
+-/** The flat "In one list" body: every session is one draggable top-level row. */
++/**
++ * The flat "In one list" body: every top-level session is one draggable row,
++ * and a parent's subagent child rows follow it with drag wiring withheld — they
++ * keep their parent's slot instead of an account position of their own.
++ */
+ function FlatList({
+   list, sessionIds, rowState, onLeaveArchivedOnly, useSessionStatus, open, onSessionRenameRequest,
+   usePanelInfo, setSessionOrder, workspaceReady, animationResetKey,
++  groupExpansion, setGroupExpanded,
+   revealSessionId, onSessionRevealed, renderSlot, t,
+ }: Pick<
+   SessionTreeProps,
+@@ -700,6 +740,8 @@ function FlatList({
+   | 'setSessionOrder'
+   | 'workspaceReady'
+   | 'animationResetKey'
++  | 'groupExpansion'
++  | 'setGroupExpanded'
+   | 'revealSessionId'
+   | 'onSessionRevealed'
+   | 'rowState'
+@@ -712,8 +754,8 @@ function FlatList({
+   const panelActive = usePanelInfo(info => info.activePanelId !== null)
+   const statuses = useSessionStatus(s => s)
+   const rows = useMemo(
+-    () => deriveFlat(list, sessionIds, rowState, statuses),
+-    [list, sessionIds, rowState, statuses],
++    () => deriveFlat(list, sessionIds, rowState, statuses, { groupExpansion }),
++    [groupExpansion, list, sessionIds, rowState, statuses],
+   )
+   const [drag, setDrag] = useState<DragState | null>(null)
+   const dropCommitted = useRef(false)
+@@ -721,6 +763,9 @@ function FlatList({
+   const currentId = panelActive
+     ? undefined
+     : Object.values(list.byId).find(session => (session.retainedBy.mainView ?? 0) > 0)?.id
++  const toggleChildRows = (sessionId: SessionId, expanded: boolean): void => {
++    setGroupExpanded(childRowsKey(sessionId), expanded)
++  }
+   const commitDrag = (activeDrag: DragState, over: NonNullable<DragState['over']>): void => {
+     if (dropCommitted.current) return
+     dropCommitted.current = true
+@@ -757,27 +802,30 @@ function FlatList({
+               onReveal={node.id === revealSessionId
+                 ? () => { onSessionRevealed(node.id) }
+                 : undefined}
+-              drag={{
+-                start: () => {
+-                  dropCommitted.current = false
+-                  setDrag({ accountKey: FLAT_SESSION_ORDER_KEY, sessionId: node.id, pinned: node.pinned, over: null })
+-                },
+-                active,
+-                marker: active && drag.over?.id === node.id ? drag.over.half : null,
+-                hover: (half) => {
+-                  setDrag(current => current === null ? current : {
+-                    ...current, over: { id: node.id, half: normalizeHalf(half) },
+-                  })
+-                },
+-                drop: (half) => {
+-                  if (drag !== null) commitDrag(drag, { id: node.id, half: normalizeHalf(half) })
+-                },
+-                end: () => {
+-                  if (drag?.over !== null && drag?.over !== undefined) commitDrag(drag, drag.over)
+-                  else setDrag(null)
+-                  dropCommitted.current = false
+-                },
+-              }}
++              onToggleChildRows={toggleChildRows}
++              drag={node.childOf === undefined
++                ? {
++                  start: () => {
++                    dropCommitted.current = false
++                    setDrag({ accountKey: FLAT_SESSION_ORDER_KEY, sessionId: node.id, pinned: node.pinned, over: null })
++                  },
++                  active,
++                  marker: active && drag.over?.id === node.id ? drag.over.half : null,
++                  hover: (half) => {
++                    setDrag(current => current === null ? current : {
++                      ...current, over: { id: node.id, half: normalizeHalf(half) },
++                    })
++                  },
++                  drop: (half) => {
++                    if (drag !== null) commitDrag(drag, { id: node.id, half: normalizeHalf(half) })
++                  },
++                  end: () => {
++                    if (drag?.over !== null && drag?.over !== undefined) commitDrag(drag, drag.over)
++                    else setDrag(null)
++                    dropCommitted.current = false
++                  },
++                }
++                : undefined}
+               t={t}
+             />
+           )
+@@ -1432,6 +1480,8 @@ export function WorkspaceBrowser({
+                 onSessionRenameRequest={requestSessionRename}
+                 renderSlot={renderSlot}
+                 setSessionOrder={saveSessionOrder}
++                groupExpansion={groupExpansion}
++                setGroupExpanded={actions.setGroupExpanded}
+                 revealSessionId={revealSessionId}
+                 onSessionRevealed={acknowledgeSessionReveal}
+                 t={t}
+diff --git a/packages/client/ui-workspace/src/client/stores.ts b/packages/client/ui-workspace/src/client/stores.ts
+index bf32225..76cfbab 100644
+--- a/packages/client/ui-workspace/src/client/stores.ts
++++ b/packages/client/ui-workspace/src/client/stores.ts
+@@ -8,7 +8,7 @@
+ import { defineStore, type EngineStoreHandle } from '@deepseek-ai/dsh-client-store'
+ import type { SessionListState } from '@deepseek-ai/dsh-api-session-controller/client'
+ import type { SessionId } from '@deepseek-ai/dsh-session/types'
+-import { reconcileManualOrder, type ArchivedFilter, type SessionRowState } from './tree.ts'
++import { CHILD_ROWS_KEY_PREFIX, reconcileManualOrder, type ArchivedFilter, type SessionRowState } from './tree.ts'
+ 
+ /** Browser-local order account for the hierarchy-free flat Session list. */
+ export const FLAT_SESSION_ORDER_KEY = '__flat_session_order__'
+@@ -22,7 +22,11 @@ export type SessionOrderBy = 'manual' | 'updated'
+ type WorkspaceViewState = {
+   groupBy: SessionGroupBy
+   orderBy: SessionOrderBy
+-  /** Explicit group expansion keyed by Workspace identity, including descendants in tree mode. */
++  /**
++   * Explicit group expansion keyed by Workspace identity, including descendants
++   * in tree mode, plus one `session:<parentId>` entry per folded parent whose
++   * subagent child rows are collapsed.
++   */
+   groupExpansion: Record<string, boolean>
+   /** Saved manual order per Workspace group plus the browser-local flat-list account. */
+   sessionOrderByAccount: Record<string, string[]>
+@@ -75,6 +79,9 @@ function copySessionOrders(
+   return Object.fromEntries(Object.entries(orders).map(([key, order]) => [key, [...order]]))
+ }
+ 
++/** Retained child-row fold keys; the oldest folds drop once a view passes this. */
++const CHILD_FOLD_LIMIT = 200
++
+ /**
+  * Create the workspace browser viewing store handle.
+  * @returns the store handle (spec + type + identity + factory in one).
+@@ -99,9 +106,14 @@ export function createWorkspaceViewStore(): EngineStoreHandle<WorkspaceViewState
+       setGroupExpanded: (d, key: string, expanded: boolean) => { d.groupExpansion[key] = expanded },
+       retainAccountKeys: (d, workspaceKeys: readonly string[]) => {
+         const retained = new Set(workspaceKeys)
+-        d.groupExpansion = Object.fromEntries(
+-          Object.entries(d.groupExpansion).filter(([key]) => retained.has(key)),
+-        )
++        const workspaceEntries = Object.entries(d.groupExpansion).filter(([key]) => retained.has(key))
++        // Workspace keys own group sections; `session:` keys own one parent's
++        // child-row fold. A folded parent that no longer exists leaves an
++        // unreachable key, so the fold set stays bounded at CHILD_FOLD_LIMIT.
++        const folds = Object.entries(d.groupExpansion)
++          .filter(([key]) => !retained.has(key) && key.startsWith(CHILD_ROWS_KEY_PREFIX))
++          .slice(-CHILD_FOLD_LIMIT)
++        d.groupExpansion = Object.fromEntries([...workspaceEntries, ...folds])
+         d.sessionOrderByAccount = Object.fromEntries(
+           Object.entries(d.sessionOrderByAccount).filter(([key]) => retained.has(key)),
+         )
+diff --git a/packages/client/ui-workspace/src/client/tree.ts b/packages/client/ui-workspace/src/client/tree.ts
+index eb67d0e..ed4b3c8 100644
+--- a/packages/client/ui-workspace/src/client/tree.ts
++++ b/packages/client/ui-workspace/src/client/tree.ts
+@@ -31,16 +31,37 @@ export function owningGroupKey(
+     ?.workspaceId as string | undefined) ?? UNGROUPED_KEY
+ }
+ 
++/**
++ * View-key prefix for one Session's subagent child rows. Their fold state
++ * lives in the shared group-expansion map, so the prefix keeps those keys clear
++ * of Workspace keys — including {@link UNGROUPED_KEY}, which is the empty key.
++ */
++export const CHILD_ROWS_KEY_PREFIX = 'session:'
++
++/**
++ * Build the view key that folds one parent Session's subagent child rows.
++ * @param sessionId - parent Session owning the loaded catalog.
++ * @returns the prefixed expansion key.
++ */
++export function childRowsKey(sessionId: SessionId): string {
++  return `${CHILD_ROWS_KEY_PREFIX}${sessionId}`
++}
++
+ /** Pending interaction kinds with dedicated Workspace-row presentation. */
+ export type SessionPendingInteractionStatus = 'approval' | 'plan-review' | 'question'
+ type SessionStatuses = SessionStatusSnapshot
+ 
++/** One entry of a parent Session's projected subagent catalog. */
++type SubagentCatalogEntry = NonNullable<
++  SessionListState['projectionsBySession'][SessionId]['values']['subagentCatalog']
++>[number]
++
+ function mainSessionId(list: SessionListState): SessionId | undefined {
+   return Object.values(list.byId)
+     .find(session => (session.retainedBy.mainView ?? 0) > 0)?.id
+ }
+ 
+-/** One top-level session row in a group or the flat list. */
++/** One session row in a group or the flat list: a top-level row, or a parent's indented subagent child row. */
+ export interface SessionNode {
+   id: SessionId
+   /** Stored title, or empty; the renderer localizes blank and unnamed row labels. */
+@@ -59,6 +80,14 @@ export interface SessionNode {
+   /** In the registry-global archive set: shown grayed in place and not openable. */
+   archived: boolean
+   updatedAt: number
++  /** Direct subagent children the loaded catalog can render; absent while the parent has none. */
++  childCount?: number
++  /** Child rows follow this row right now — `false` only while the parent is folded. */
++  childExpanded?: boolean
++  /** Nesting level: absent on a top-level row and `1` on a subagent child row. */
++  depth?: number
++  /** Parent Session of a subagent child row; absent on every top-level row. */
++  childOf?: SessionId
+ }
+ 
+ /** Session order selected by the Workspace browser. */
+@@ -74,12 +103,12 @@ export interface GroupNode {
+   /** Workspace creation time (epoch ms); absent only for the ungrouped bucket. */
+   createdAt: number | undefined
+   label: string
+-  /** Total visible sessions in the group. */
++  /** Total visible top-level sessions in the group; indented child rows do not count. */
+   sessionCount: number
+   expanded: boolean
+   /** The group contains the selected session (active folder tint; supplied here so the renderer never scans). */
+   containsCurrent: boolean
+-  /** Visible session rows (empty while the group is folded). */
++  /** Visible session rows, each parent followed by its child rows while unfolded (empty while the group is folded). */
+   sessions: readonly SessionNode[]
+ }
+ 
+@@ -111,6 +140,11 @@ export interface TreeView {
+   expandedGroups: readonly string[]
+   /** Browser-local order for Sessions without a backing Workspace account. */
+   ungroupedOrder?: readonly string[]
++  /**
++   * Explicit expansion by view key. Workspace keys drive group sections; a
++   * {@link childRowsKey} entry folds the child rows of that parent Session.
++   */
++  groupExpansion?: Readonly<Record<string, boolean>>
+ }
+ 
+ interface Group {
+@@ -418,19 +452,152 @@ function sessionNode(
+ }
+ 
+ /**
+- * Derive the workspace browser groups with every session as a top-level row.
++ * Resolve the parent that lists one child Session in its loaded catalog.
++ * @param list - sessions list snapshot carrying catalog projections.
++ * @param childId - Session id to look up as a catalog child.
++ * @returns the owning parent id, or undefined when no loaded catalog lists it.
++ */
++export function childParentOf(list: SessionListState, childId: SessionId): SessionId | undefined {
++  for (const [parentId, projection] of Object.entries(list.projectionsBySession)) {
++    const catalog = projection?.values.subagentCatalog
++    if (catalog === undefined) continue
++    if (catalog.some(child => child.id === childId && child.mode !== 'external')) return parentId as SessionId
++  }
++  return undefined
++}
++
++/**
++ * Catalog entries the browser may render: the parent's loaded projection minus
++ * `external` children, which own no Client row and so cannot be opened, titled,
++ * or status-tracked from the list.
++ * @param list - sessions list snapshot.
++ * @param parentId - Session whose catalog is required.
++ * @returns live catalog entries in catalog order.
++ */
++function childCatalog(list: SessionListState, parentId: SessionId): readonly SubagentCatalogEntry[] {
++  const catalog = list.projectionsBySession[parentId]?.values.subagentCatalog
++  if (catalog === undefined) return []
++  return catalog.filter(child => child.mode !== 'external')
++}
++
++/**
++ * Whether one parent's child rows are unfolded. A parent starts expanded and
++ * only an explicit `false` folds it, so an untouched browser shows the children
++ * of every Session that has them.
++ * @param groupExpansion - persisted expansion map, when the view has one.
++ * @param sessionId - parent Session owning the child rows.
++ * @returns true while the child rows render.
++ */
++function childRowsExpanded(
++  groupExpansion: TreeView['groupExpansion'],
++  sessionId: SessionId,
++): boolean {
++  return groupExpansion?.[childRowsKey(sessionId)] !== false
++}
++
++/**
++ * Project one live catalog entry as an indented child row. Title precedence is
++ * the mirrored Session title, then the catalog label, then the id's short form,
++ * so a rename shows up while a fresh child keeps its spawn label. A child row
++ * keeps no row menu and no pin: it takes its parent's position and the catalog
++ * decides its order, and it reports no catalog children of its own, so nested
++ * catalogs stay unprojected.
++ * @param entry - live catalog entry.
++ * @param list - sessions list snapshot carrying the mirrored subagent summary.
++ * @param statuses - unified UI status by Session.
++ * @param parentId - Session row the child hangs under.
++ * @param archived - registry-global archive set; a child row reports its own membership.
++ * @returns the child row.
++ */
++function childNode(
++  entry: SubagentCatalogEntry,
++  list: SessionListState,
++  statuses: SessionStatuses,
++  parentId: SessionId,
++  archived: ReadonlySet<SessionId>,
++): SessionNode {
++  const summary = list.byId[entry.id]
++  const status = statuses.get(entry.id)
++  const summaryTitle = summary === undefined ? '' : sessionTitle(summary)
++  /* v8 ignore next -- a catalog projected from an older released Session log can omit label; the declaration requires it. */
++  const label = entry.label ?? ''
++  // A rename writes the mirrored Session title, so the title outranks the
++  // catalog label the spawn recorded.
++  return {
++    id: entry.id,
++    title: summaryTitle !== '' ? summaryTitle : label !== '' ? label : entry.id.slice(0, 8),
++    blank: false,
++    running: status?.running ?? summary?.running ?? false,
++    runningSubagentCount: 0,
++    completed: status?.completionUnread === true,
++    pinned: false,
++    archived: archived.has(entry.id),
++    updatedAt: summary?.updatedAt ?? 0,
++    depth: 1,
++    childOf: parentId,
++  }
++}
++
++/**
++ * Interleave every parent row with its indented subagent child rows, which
++ * follow that parent's own row and only while it is unfolded. The parent row
++ * carries the catalog size and fold state the renderer's toggle needs.
++ * @param rows - top-level rows in render order.
++ * @param list - sessions list snapshot (catalog projections and mirrored summaries).
++ * @param statuses - unified UI status by Session.
++ * @param groupExpansion - persisted folds; a folded parent contributes no child rows.
++ * @param archived - registry-global archive set; a child row reports its own membership.
++ * @param archivedFilter - archive visibility, applied to child rows exactly as to parents;
++ * the archived-only view keeps an archived parent's archived children listed, because
++ * that view is where archived Sessions are recovered.
++ * @returns rows in render order, each child directly after its parent.
++ */
++function withChildRows(
++  rows: readonly SessionNode[],
++  list: SessionListState,
++  statuses: SessionStatuses,
++  groupExpansion: TreeView['groupExpansion'],
++  archived: ReadonlySet<SessionId>,
++  archivedFilter: ArchivedFilter,
++): SessionNode[] {
++  const out: SessionNode[] = []
++  for (const row of rows) {
++    const catalog = childCatalog(list, row.id)
++    // An archived parent keeps its slot closed in the ordinary views: a grayed
++    // row cannot operate its catalog. The archived-only view is the recovery
++    // surface for archived Sessions, so there an archived parent still lists
++    // its own archived children, exactly as the filter rule below states.
++    if (catalog.length === 0 || (row.archived && archivedFilter !== 'only')) {
++      out.push(row)
++      continue
++    }
++    const expanded = childRowsExpanded(groupExpansion, row.id)
++    const visible = archivedFilter === 'only'
++      ? catalog.filter(entry => archived.has(entry.id))
++      : catalog.filter(entry => archivedFilter === 'show' || !archived.has(entry.id))
++    out.push({ ...row, childCount: visible.length, childExpanded: expanded })
++    if (!expanded) continue
++    for (const entry of visible) out.push(childNode(entry, list, statuses, row.id, archived))
++  }
++  return out
++}
++
++/**
++ * Derive the workspace browser groups with every visible session as a row.
+  *
+  * Every group shows, except that the archived-only filter drops groups
+  * without visible members; sessions populate under expanded groups with
+  * pinned rows leading in the selected local order. Blank sessions are
+  * excluded except for the selected provisional New Session row; archived
+- * sessions keep their slots and appear per the archived filter. Content
+- * search lives outside this derivation (see {@link deriveSearchResults}).
++ * sessions keep their slots and appear per the archived filter. A Session with
++ * a loaded subagent catalog carries its child rows inline below it, folded by
++ * its {@link childRowsKey} entry. Content search lives outside this derivation
++ * (see {@link deriveSearchResults}).
+  * @param list - sessions list snapshot (`mainView` retention feeds containsCurrent).
+  * @param workspaces - real Workspaces in Host group order with caller-projected Session order.
+  * @param rowState - registry-global pin and archive sets plus the archived filter.
+  * @param statuses - unified UI status by Session.
+- * @param view - local expansion arrays.
++ * @param view - local expansion arrays plus the persisted group/child folds.
+  * @returns group sections in render order.
+  */
+ export function deriveGroups(
+@@ -460,8 +627,15 @@ export function deriveGroups(
+       expanded,
+       containsCurrent: g.key === currentGroup,
+       sessions: expanded
+-        ? sectionMembers(g.sessions, pinned, archived)
+-          .map(session => sessionNode(session, list, statuses, pinned, archived))
++        ? withChildRows(
++          sectionMembers(g.sessions, pinned, archived)
++            .map(session => sessionNode(session, list, statuses, pinned, archived)),
++          list,
++          statuses,
++          view.groupExpansion,
++          archived,
++          rowState.archivedFilter,
++        )
+         : [],
+     })
+   }
+@@ -499,11 +673,13 @@ export function visibleSessionIds(
+ 
+ /**
+  * Derive flat rows from the browser's complete ordered Session ids, with
+- * pinned rows fronted ahead of the supplied order.
++ * pinned rows fronted ahead of the supplied order. Each row carries its
++ * subagent child rows inline below it, exactly as the grouped view does.
+  * @param list - sessions list snapshot used to select the ids.
+  * @param sessionIds - complete account members in the selected order, including hidden archives.
+  * @param rowState - registry-global pin and archive sets plus the archived filter.
+  * @param statuses - unified UI status by Session.
++ * @param view - persisted child folds; omitted when no fold store is supplied.
+  * @returns flat rows in sectioned order with current status indicators.
+  */
+ export function deriveFlat(
+@@ -511,6 +687,7 @@ export function deriveFlat(
+   sessionIds: readonly SessionId[],
+   rowState: SessionRowState,
+   statuses: SessionStatuses,
++  view: Pick<TreeView, 'groupExpansion'> = {},
+ ): SessionNode[] {
+   const archived = new Set(rowState.archivedSessionIds)
+   const pinned = new Set(rowState.pinnedSessionIds)
+@@ -521,8 +698,15 @@ export function deriveFlat(
+       ? [session]
+       : []
+   })
+-  return sectionMembers(members, pinned, archived)
+-    .map(session => sessionNode(session, list, statuses, pinned, archived))
++  return withChildRows(
++    sectionMembers(members, pinned, archived)
++      .map(session => sessionNode(session, list, statuses, pinned, archived)),
++    list,
++    statuses,
++    view.groupExpansion,
++    archived,
++    rowState.archivedFilter,
++  )
+ }
+ 
+ /**
+diff --git a/D:/ds_work/dsh-src/packages/client/ui-workspace/tests/child-rows.client.spec.tsx b/packages/client/ui-workspace/tests/child-rows.client.spec.tsx
+new file mode 100644
+index 0000000..c065d64
+--- /dev/null
++++ b/packages/client/ui-workspace/tests/child-rows.client.spec.tsx
+@@ -0,0 +1,602 @@
++// @vitest-environment jsdom
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import type { Mock } from 'vitest'
++import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
++import { useState } from 'react'
++import type { SessionListState, SessionProjectionSnapshot, SessionSummary } from '@deepseek-ai/dsh-api-session-controller/client'
++import type { WorkspaceId, WorkspaceView } from '@deepseek-ai/dsh-api-workspace-controller/client'
++import type { SessionStatusSnapshot } from '@deepseek-ai/dsh-client-ui-session/client'
++import type { SessionId } from '@deepseek-ai/dsh-session/types'
++import { makeTranslate } from '@deepseek-ai/dsh-client-test-runtime'
++import type { PropsRenderSlots } from '@deepseek-ai/dsh-client-ui-slots'
++import { en as commonEn } from '@deepseek-ai/dsh-client-locale/src/locales/en.ts'
++import { zh as commonZh } from '@deepseek-ai/dsh-client-locale/src/locales/zh.ts'
++import type { RowDragProps } from '../src/client/rows/Rows.tsx'
++import { SessionNodeItem } from '../src/client/rows/Rows.tsx'
++import { createWorkspaceViewStore } from '../src/client/stores.ts'
++import {
++  CHILD_ROWS_KEY_PREFIX, childParentOf, childRowsKey, deriveFlat, deriveGroups, type SessionRowState,
++} from '../src/client/tree.ts'
++import { en, zh } from '../src/client/locales.ts'
++
++afterEach(cleanup)
++
++beforeEach(() => { localStorage.clear() })
++
++const t = makeTranslate(zh, commonZh) as never
++const tEn = makeTranslate(en, commonEn) as never
++
++const sid = (id: string) => id as SessionId
++const wid = (id: string) => id as WorkspaceId
++
++type RowSlotName =
++  | 'sidebar.workspaces.session.menu.item'
++  | 'sidebar.workspaces.session.row.action'
++  | 'sidebar.session.row.leading'
++  | 'sidebar.session.row.hover'
++type RowRenderSlot = PropsRenderSlots<RowSlotName>['renderSlot']
++
++/** No row lists, leading decorations, or hover sections: the rows render bare. */
++const renderNoRowEntries: RowRenderSlot = () => null
++
++/** One recorded `renderSlot` occurrence: which row list asked for which Session. */
++interface SlotCall {
++  /** Slot name as authored by the row; the assertions pin the exact names. */
++  name: string
++  sessionId: SessionId
++}
++
++/**
++ * Record the row lists each row asks for. The renderer resolves entries from
++ * these calls, so a list a row never asks for is a list no entry can occupy.
++ * The action list renders one pressable stand-in, so a test can press an entry
++ * the way a user does.
++ * @returns the stub renderer and the calls it collected.
++ */
++function recordingSlots(): { renderSlot: RowRenderSlot; calls: SlotCall[] } {
++  const calls: SlotCall[] = []
++  // The slot renderer is generic over the slot name, so its own parameters
++  // carry no contextual type here; the owner is the row identity every row
++  // seat takes.
++  const renderSlot: RowRenderSlot = (name: string, owner: object) => {
++    calls.push({ name, sessionId: (owner as { sessionId: SessionId }).sessionId })
++    return name === 'sidebar.workspaces.session.row.action'
++      ? <button type="button" data-testid="row-action-entry" />
++      : null
++  }
++  return { renderSlot, calls }
++}
++
++const noStatuses: SessionStatusSnapshot = new Map()
++
++const summary = (id: string, updatedAt: number, overrides: Partial<SessionSummary> = {}): SessionSummary => ({
++  id: sid(id), title: id, displayTitle: id, running: false, blank: false,
++  retainedBy: {}, updatedAt, ...overrides,
++})
++
++/** A subagent child: catalogued by its parent and hidden as a top-level row. */
++const childSummary = (id: string, updatedAt: number, parentId: SessionId): SessionSummary =>
++  summary(id, updatedAt, { origin: 'subagent' as const, parentId })
++
++const catalogOf = (...entries: readonly { id: string; mode?: 'continuable' | 'external' }[]): SessionProjectionSnapshot => ({
++  values: {
++    subagentCatalog: entries.map(entry => ({
++      id: sid(entry.id), mode: entry.mode ?? 'continuable', label: entry.id, createdAt: 1,
++    })),
++  },
++  state: 'ready',
++  error: null,
++})
++
++const sessionsOf = (
++  items: readonly SessionSummary[],
++  catalogs: Readonly<Record<string, SessionProjectionSnapshot>> = {},
++): SessionListState => ({
++  ids: items.map(item => item.id),
++  byId: Object.fromEntries(items.map(item => [item.id, item])),
++  phase: 'ready',
++  projectionsBySession: catalogs,
++})
++
++const workspace = (id: string, sessionIds: readonly string[], title = id): WorkspaceView => ({
++  workspaceId: wid(id), path: `/projects/${id}`, title,
++  sessionIds: sessionIds.map(sid), createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
++})
++
++const rowState = (options: {
++  archived?: readonly string[]
++  pinned?: readonly string[]
++  archivedFilter?: SessionRowState['archivedFilter']
++} = {}): SessionRowState => ({
++  pinnedSessionIds: (options.pinned ?? []).map(sid),
++  archivedSessionIds: (options.archived ?? []).map(sid),
++  archivedFilter: options.archivedFilter ?? 'default',
++})
++
++const noRows = rowState()
++
++const dragProps = (): RowDragProps => ({
++  start: vi.fn(), active: false, marker: null, hover: vi.fn(), drop: vi.fn(), end: vi.fn(),
++})
++
++/** The row element owning one title: the same association the pointer handlers use. */
++function titleRow(title: string): HTMLElement {
++  const row = screen.getByText(title).closest<HTMLElement>('[role="treeitem"]')
++  if (row === null) throw new Error(`no session row owns the title ${title}`)
++  return row
++}
++
++/**
++ * Parent-plus-children list driven by the real derivation: the fold state lives
++ * here exactly as the browser keeps it, so a toggle click re-derives the rows.
++ * @param props.list - sessions snapshot carrying the parent's catalog.
++ * @param props.workspaces - the expanded Workspace group.
++ * @param props.state - pin, archive, and archived-filter membership.
++ * @param props.onOpen - open a row by id.
++ * @param props.onRenameRequest - open Rename from a title double-click.
++ * @param props.expansion - initial persisted folds, keyed as the browser stores them.
++ * @param props.slots - row-list renderer; defaults to rendering no entries.
++ * @returns every derived row, children indented under their parent.
++ */
++function ChildRowTree({
++  list, workspaces, state, onOpen, onRenameRequest, expansion = {}, slots = renderNoRowEntries,
++}: {
++  list: SessionListState
++  workspaces: readonly WorkspaceView[]
++  state: SessionRowState
++  onOpen: (id: SessionId) => void
++  onRenameRequest: (id: SessionId, title: string) => void
++  expansion?: Readonly<Record<string, boolean>>
++  slots?: RowRenderSlot
++}) {
++  const [groupExpansion, setGroupExpansion] = useState<Readonly<Record<string, boolean>>>(expansion)
++  const rows = deriveGroups(list, workspaces, state, noStatuses, {
++    expandedGroups: workspaces.map(entry => entry.workspaceId),
++    groupExpansion,
++  }).flatMap(group => group.sessions)
++  const drag = dragProps()
++  return (
++    <>
++      {rows.map(row => (
++        <SessionNodeItem
++          key={row.id}
++          node={row}
++          currentId={undefined}
++          now={0}
++          onOpen={onOpen}
++          onRenameRequest={onRenameRequest}
++          onToggleChildRows={(id, expanded) => {
++            setGroupExpansion(previous => ({ ...previous, [childRowsKey(id)]: expanded }))
++          }}
++          drag={row.childOf === undefined ? drag : undefined}
++          renderSlot={slots}
++          t={t}
++        />
++      ))}
++    </>
++  )
++}
++
++/** A live parent with one live and one archived child, plus an external catalog entry. */
++function family(): {
++  list: SessionListState
++  workspaces: readonly WorkspaceView[]
++} {
++  const parent = summary('parent', 30, { title: 'Parent session' })
++  const liveChild = childSummary('live-child', 20, parent.id)
++  const archivedChild = childSummary('archived-child', 10, parent.id)
++  return {
++    list: sessionsOf([parent, liveChild, archivedChild], {
++      [parent.id]: catalogOf({ id: 'live-child' }, { id: 'archived-child' }, { id: 'external-child', mode: 'external' }),
++    }),
++    workspaces: [workspace('ws', ['parent', 'live-child', 'archived-child'])],
++  }
++}
++
++function mountFamily(options: {
++  state?: SessionRowState
++  expansion?: Readonly<Record<string, boolean>>
++} = {}): { onOpen: Mock; onRenameRequest: Mock } {
++  const onOpen = vi.fn()
++  const onRenameRequest = vi.fn()
++  const { list, workspaces } = family()
++  render(
++    <ChildRowTree
++      list={list}
++      workspaces={workspaces}
++      state={options.state ?? noRows}
++      onOpen={onOpen}
++      onRenameRequest={onRenameRequest}
++      {...options.expansion === undefined ? {} : { expansion: options.expansion }}
++    />,
++  )
++  return { onOpen, onRenameRequest }
++}
++
++describe('parent row child fold toggle', () => {
++  it('renders the children under their parent and folds them from the row toggle', () => {
++    const { onOpen } = mountFamily()
++    const toggle = screen.getByRole('button', { name: '收起/展开 2 个子会话' })
++    expect(toggle.getAttribute('aria-expanded')).toBe('true')
++    expect(toggle.textContent).toBe('\u25BE')
++
++    // Children follow their parent, indented one step, in catalog order; the
++    // external catalog entry owns no row.
++    const parentTitle = screen.getByText('Parent session')
++    const liveTitle = screen.getByText('live-child')
++    const archivedTitle = screen.getByText('archived-child')
++    expect(parentTitle.compareDocumentPosition(liveTitle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
++    expect(liveTitle.compareDocumentPosition(archivedTitle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
++    expect(titleRow('Parent session').hasAttribute('data-depth')).toBe(false)
++    expect(titleRow('live-child').getAttribute('data-depth')).toBe('1')
++    expect(titleRow('archived-child').getAttribute('data-depth')).toBe('1')
++
++    fireEvent.click(toggle)
++    expect(screen.queryByText('live-child')).toBeNull()
++    expect(screen.queryByText('archived-child')).toBeNull()
++    const collapsed = screen.getByRole('button', { name: '收起/展开 2 个子会话' })
++    expect(collapsed.getAttribute('aria-expanded')).toBe('false')
++    expect(collapsed.textContent).toBe('\u25B8')
++    // The toggle is its own control: folding never opens the Session.
++    expect(onOpen).not.toHaveBeenCalled()
++
++    fireEvent.click(collapsed)
++    expect(screen.getByText('live-child')).toBeTruthy()
++    expect(screen.getByText('archived-child')).toBeTruthy()
++    const expanded = screen.getByRole('button', { name: '收起/展开 2 个子会话' })
++    expect(expanded.getAttribute('aria-expanded')).toBe('true')
++    expect(expanded.textContent).toBe('\u25BE')
++    expect(onOpen).not.toHaveBeenCalled()
++  })
++
++  it('offers no toggle while every child is filtered out', () => {
++    // The archived-only child is hidden by the default filter, so the parent
++    // owns no visible child row and reports no catalog size.
++    const parent = summary('parent', 30, { title: 'Parent session' })
++    const archivedChild = childSummary('archived-child', 10, parent.id)
++    render(
++      <ChildRowTree
++        list={sessionsOf([parent, archivedChild], { [parent.id]: catalogOf({ id: 'archived-child' }) })}
++        workspaces={[workspace('ws', ['parent', 'archived-child'])]}
++        state={rowState({ archived: ['archived-child'] })}
++        onOpen={vi.fn()}
++        onRenameRequest={vi.fn()}
++      />,
++    )
++    expect(screen.getByText('Parent session')).toBeTruthy()
++    expect(screen.queryByText('archived-child')).toBeNull()
++    expect(screen.queryByRole('button', { name: /收起\/展开/ })).toBeNull()
++  })
++
++  it('reflects a persisted fold in the first render', () => {
++    mountFamily({ expansion: { [childRowsKey(sid('parent'))]: false } })
++    expect(screen.getByText('Parent session')).toBeTruthy()
++    expect(screen.queryByText('live-child')).toBeNull()
++    const toggle = screen.getByRole('button', { name: '收起/展开 2 个子会话' })
++    expect(toggle.getAttribute('aria-expanded')).toBe('false')
++    expect(toggle.textContent).toBe('\u25B8')
++  })
++})
++
++describe('subagent child row presentation', () => {
++  it('carries no row menu, no drag handle, and no title rename', () => {
++    const { onRenameRequest } = mountFamily()
++    const parentRow = titleRow('Parent session')
++    const childRow = titleRow('live-child')
++
++    // The parent keeps the verbs the catalog owns; the child row owns none.
++    expect(within(parentRow).getByRole('button', { name: '会话“Parent session”的操作' })).toBeTruthy()
++    expect(within(childRow).queryByRole('button', { name: '会话“live-child”的操作' })).toBeNull()
++
++    expect(parentRow.draggable).toBe(true)
++    expect(childRow.draggable).toBe(false)
++
++    fireEvent.doubleClick(screen.getByText('live-child'))
++    expect(onRenameRequest).not.toHaveBeenCalled()
++    fireEvent.doubleClick(screen.getByText('Parent session'))
++    expect(onRenameRequest).toHaveBeenCalledWith(sid('parent'), 'Parent session')
++  })
++
++  it('titles a child row by its live Session title, then the catalog label', () => {
++    const parent = summary('parent', 30, { title: 'Parent session' })
++    // Renaming a child writes the mirrored summary title; the label it spawned
++    // with then only titles a child whose summary title is still blank.
++    const renamed = childSummary('renamed-child', 20, parent.id)
++    render(
++      <ChildRowTree
++        list={sessionsOf(
++          [parent, { ...renamed, title: 'Renamed child' }, childSummary('labelled-child', 10, parent.id)],
++          { [parent.id]: catalogOf({ id: 'renamed-child' }, { id: 'labelled-child' }) },
++        )}
++        workspaces={[workspace('ws', ['parent', 'renamed-child', 'labelled-child'])]}
++        state={noRows}
++        onOpen={vi.fn()}
++        onRenameRequest={vi.fn()}
++      />,
++    )
++    expect(screen.getByText('Renamed child')).toBeTruthy()
++    expect(screen.getByText('labelled-child')).toBeTruthy()
++  })
++
++  it('titles a child row from the catalog label, then the id short form', () => {
++    const parent = summary('parent', 30, { title: 'Parent session' })
++    // An entry spawns before its mirrored Session summary exists; the label it
++    // recorded is the only title source until that summary lands.
++    const catalogs: Readonly<Record<string, SessionProjectionSnapshot>> = {
++      [parent.id]: {
++        state: 'ready',
++        error: null,
++        values: {
++          subagentCatalog: [
++            { id: sid('noid0001'), mode: 'continuable', label: '', createdAt: 1 },
++            { id: sid('noid0002'), mode: 'continuable', label: 'Spawned label', createdAt: 1 },
++          ],
++        },
++      },
++    }
++    render(
++      <ChildRowTree
++        list={sessionsOf([parent], catalogs)}
++        workspaces={[workspace('ws', ['parent'])]}
++        state={noRows}
++        onOpen={vi.fn()}
++        onRenameRequest={vi.fn()}
++      />,
++    )
++    expect(screen.getByText('noid0001')).toBeTruthy()
++    expect(screen.getByText('Spawned label')).toBeTruthy()
++  })
++
++  it('renders the English accessible name from the locale seat', () => {
++    const parent = summary('parent', 30, { title: 'Parent session' })
++    const child = childSummary('live-child', 20, parent.id)
++    render(
++      <SessionNodeItem
++        node={{
++          id: parent.id, title: 'Parent session', blank: false, running: false, runningSubagentCount: 0,
++          completed: false, pinned: false, archived: false, updatedAt: 30, childCount: 1, childExpanded: true,
++        }}
++        currentId={undefined}
++        now={0}
++        onOpen={vi.fn()}
++        onRenameRequest={vi.fn()}
++        onToggleChildRows={vi.fn()}
++        renderSlot={renderNoRowEntries}
++        t={tEn}
++      />,
++    )
++    expect(screen.getByRole('button', { name: 'Toggle 1 child session(s)' })).toBeTruthy()
++    // The child node itself renders no toggle: its own catalog is unprojected.
++    cleanup()
++    render(
++      <SessionNodeItem
++        node={{
++          id: child.id, title: 'live-child', blank: false, running: false, runningSubagentCount: 0,
++          completed: false, pinned: false, archived: false, updatedAt: 20, depth: 1, childOf: parent.id,
++        }}
++        currentId={undefined}
++        now={0}
++        onOpen={vi.fn()}
++        onRenameRequest={vi.fn()}
++        onToggleChildRows={vi.fn()}
++        renderSlot={renderNoRowEntries}
++        t={tEn}
++      />,
++    )
++    expect(screen.queryByRole('button', { name: /Toggle/ })).toBeNull()
++  })
++})
++
++describe('archived child row restore strip', () => {
++  const forRow = (calls: readonly SlotCall[], id: string): string[] =>
++    calls.filter(call => call.sessionId === sid(id)).map(call => call.name)
++
++  /** The family under the show filter: the archived child row is listed too. */
++  function mountShow(): { calls: SlotCall[]; onOpen: Mock } {
++    const { list, workspaces } = family()
++    const { renderSlot, calls } = recordingSlots()
++    const onOpen = vi.fn()
++    render(
++      <ChildRowTree
++        list={list}
++        workspaces={workspaces}
++        state={rowState({ archived: ['archived-child'], archivedFilter: 'show' })}
++        onOpen={onOpen}
++        onRenameRequest={vi.fn()}
++        slots={renderSlot}
++      />,
++    )
++    return { calls, onOpen }
++  }
++
++  it('offers the archived child row its restore strip and nothing else', () => {
++    const { calls } = mountShow()
++    expect(screen.getByText('archived-child')).toBeTruthy()
++    // Unarchive is the archived row's only applicable verb, and this strip is
++    // the only row list an archived child row asks for: no menu list, and no
++    // leading seat either, because an archived row keeps that cell blank.
++    expect(forRow(calls, 'archived-child')).toEqual(['sidebar.workspaces.session.row.action'])
++  })
++
++  it('keeps the strip\'s press out of the archived child row', () => {
++    const { onOpen } = mountShow()
++    // The strip owns its own press, so restoring the row never opens it.
++    fireEvent.click(within(titleRow('archived-child')).getByTestId('row-action-entry'))
++    expect(onOpen).not.toHaveBeenCalled()
++  })
++
++  it('keeps both lists off a live child row and both on its parent', () => {
++    const { calls } = mountShow()
++    expect(forRow(calls, 'live-child')).not.toContain('sidebar.workspaces.session.row.action')
++    expect(forRow(calls, 'live-child')).not.toContain('sidebar.workspaces.session.menu.item')
++    // The parent row keeps the verbs the catalog owns; only it may ask for the
++    // menu list, so closing or narrowing that block for child rows cannot
++    // silently cost the parent its menu.
++    expect(forRow(calls, 'parent')).toContain('sidebar.workspaces.session.menu.item')
++    expect(forRow(calls, 'parent')).toContain('sidebar.workspaces.session.row.action')
++    expect(calls
++      .filter(call => call.name === 'sidebar.workspaces.session.menu.item')
++      .map(call => call.sessionId)).toEqual([sid('parent')])
++  })
++})
++
++describe('child rows in the tree derivation', () => {
++  it('hides archived children by default and counts only the visible ones', () => {
++    const { list, workspaces } = family()
++    const groups = deriveGroups(list, workspaces, rowState({ archived: ['archived-child'] }), noStatuses, {
++      expandedGroups: ['ws'],
++    })
++    const rows = groups[0]!.sessions
++    expect(rows.map(row => row.id)).toEqual([sid('parent'), sid('live-child')])
++    const parent = rows[0]!
++    expect(parent).toMatchObject({ childCount: 1, childExpanded: true })
++    expect(rows[1]).toMatchObject({ childOf: sid('parent'), depth: 1, pinned: false, archived: false })
++    // A Workspace group counts its top-level members only.
++    expect(groups[0]!.sessionCount).toBe(1)
++  })
++
++  it('lists every child under the show filter, marking the archived one', () => {
++    const { list, workspaces } = family()
++    const rows = deriveGroups(
++      list, workspaces, rowState({ archived: ['archived-child'], archivedFilter: 'show' }), noStatuses,
++      { expandedGroups: ['ws'] },
++    )[0]!.sessions
++    expect(rows.map(row => row.id)).toEqual([sid('parent'), sid('live-child'), sid('archived-child')])
++    expect(rows[0]!.childCount).toBe(2)
++    expect(rows[2]!.archived).toBe(true)
++  })
++
++  it('keeps an archived parent listing its archived children in the archived-only view', () => {
++    // The archived-only view is the recovery surface: an archived parent is the
++    // only kind of parent that view lists, so its archived children must stay
++    // listed under it.
++    const { list, workspaces } = family()
++    const rows = deriveGroups(
++      list, workspaces, rowState({ archived: ['parent', 'archived-child'], archivedFilter: 'only' }), noStatuses,
++      { expandedGroups: ['ws'] },
++    )[0]!.sessions
++    expect(rows.map(row => row.id)).toEqual([sid('parent'), sid('archived-child')])
++    expect(rows[0]).toMatchObject({ archived: true, childCount: 1 })
++    expect(rows[1]).toMatchObject({ childOf: sid('parent'), depth: 1, archived: true })
++  })
++
++  it('keeps an archived parent\'s child rows closed in the ordinary views', () => {
++    const { list, workspaces } = family()
++    for (const archivedFilter of ['default', 'show'] as const) {
++      const rows = deriveGroups(
++        list,
++        workspaces,
++        rowState({ archived: ['parent', 'archived-child'], archivedFilter }),
++        noStatuses,
++        { expandedGroups: ['ws'] },
++      )[0]!.sessions
++      expect(rows.map(row => row.id)).toEqual(archivedFilter === 'show' ? [sid('parent')] : [])
++      expect(rows.every(row => row.childCount === undefined && row.childOf === undefined)).toBe(true)
++    }
++  })
++
++  it('omits a folded parent\'s child rows while keeping its catalog size', () => {
++    const { list, workspaces } = family()
++    const rows = deriveGroups(
++      list, workspaces, rowState({ archived: ['archived-child'], archivedFilter: 'show' }), noStatuses,
++      { expandedGroups: ['ws'], groupExpansion: { [childRowsKey(sid('parent'))]: false } },
++    )[0]!.sessions
++    expect(rows.map(row => row.id)).toEqual([sid('parent')])
++    expect(rows[0]).toMatchObject({ childCount: 2, childExpanded: false })
++  })
++
++  it('interleaves child rows in the flat list under the same fold and archive rules', () => {
++    const { list } = family()
++    const complete = [sid('parent')]
++    const flatIds = (state: SessionRowState, groupExpansion?: Readonly<Record<string, boolean>>): string[] =>
++      deriveFlat(list, complete, state, noStatuses, groupExpansion === undefined ? {} : { groupExpansion })
++        .map(row => row.id as string)
++    expect(flatIds(rowState({ archived: ['archived-child'] }))).toEqual(['parent', 'live-child'])
++    expect(flatIds(rowState({ archived: ['archived-child'], archivedFilter: 'show' })))
++      .toEqual(['parent', 'live-child', 'archived-child'])
++    expect(flatIds(rowState({ archived: ['parent', 'archived-child'], archivedFilter: 'only' })))
++      .toEqual(['parent', 'archived-child'])
++    expect(flatIds(
++      rowState({ archived: ['archived-child'], archivedFilter: 'show' }),
++      { [childRowsKey(sid('parent'))]: false },
++    )).toEqual(['parent'])
++  })
++
++  it('keys one fold per parent under the child-row prefix', () => {
++    expect(CHILD_ROWS_KEY_PREFIX).toBe('session:')
++    expect(childRowsKey(sid('parent'))).toBe('session:parent')
++  })
++})
++
++describe('childParentOf', () => {
++  it('resolves the parent whose live catalog lists the Session', () => {
++    const { list } = family()
++    expect(childParentOf(list, sid('live-child'))).toBe(sid('parent'))
++    expect(childParentOf(list, sid('archived-child'))).toBe(sid('parent'))
++  })
++
++  it('ignores an external catalog entry, which owns no Client row', () => {
++    const { list } = family()
++    expect(childParentOf(list, sid('external-child'))).toBeUndefined()
++  })
++
++  it('ignores a projection with no catalog and a Session no catalog lists', () => {
++    const { list } = family()
++    const bare: SessionProjectionSnapshot = { values: {}, state: 'ready', error: null }
++    const withoutCatalog = {
++      ...list,
++      projectionsBySession: { ...list.projectionsBySession, [sid('parent')]: bare },
++    }
++    // With the parent's catalog unloaded, nothing lists its children any more.
++    expect(childParentOf(withoutCatalog, sid('live-child'))).toBeUndefined()
++    expect(childParentOf(sessionsOf([summary('lonely', 1)]), sid('lonely'))).toBeUndefined()
++  })
++})
++
++describe('retainAccountKeys', () => {
++  it('keeps child-row folds and current Workspace keys, dropping expired ones', () => {
++    const store = createWorkspaceViewStore().create()
++    store.actions.setGroupExpanded('ws-live', true)
++    store.actions.setGroupExpanded('ws-gone', true)
++    store.actions.setGroupExpanded(childRowsKey(sid('parent')), false)
++    store.actions.setGroupExpanded(childRowsKey(sid('other')), true)
++    store.actions.setOrderBy('manual', { 'ws-live': ['kept'], 'ws-gone': ['dropped'] })
++
++    store.actions.retainAccountKeys(['ws-live'])
++
++    const snapshot = store.getSnapshot()
++    expect(snapshot.groupExpansion).toEqual({
++      'ws-live': true,
++      'session:parent': false,
++      'session:other': true,
++    })
++    expect(snapshot.sessionOrderByAccount).toEqual({ 'ws-live': ['kept'] })
++  })
++
++  it('drops every Workspace key when the baseline reports none', () => {
++    const store = createWorkspaceViewStore().create()
++    store.actions.setGroupExpanded('ws-gone', true)
++    store.actions.setGroupExpanded(childRowsKey(sid('parent')), false)
++    store.actions.setOrderBy('manual', { 'ws-gone': ['dropped'] })
++
++    store.actions.retainAccountKeys([])
++
++    expect(store.getSnapshot().groupExpansion).toEqual({ 'session:parent': false })
++    expect(store.getSnapshot().sessionOrderByAccount).toEqual({})
++  })
++
++  it('bounds retained child folds at the newest 200', () => {
++    const store = createWorkspaceViewStore().create()
++    for (let index = 0; index < 250; index += 1) {
++      store.actions.setGroupExpanded(childRowsKey(sid(`child-${index}`)), false)
++    }
++
++    store.actions.retainAccountKeys([])
++
++    const folds = store.getSnapshot().groupExpansion
++    expect(Object.keys(folds)).toHaveLength(200)
++    expect(folds).not.toHaveProperty(childRowsKey(sid('child-49')))
++    expect(folds[childRowsKey(sid('child-50'))]).toBe(false)
++    expect(folds[childRowsKey(sid('child-249'))]).toBe(false)
++  })
++})
+diff --git a/packages/client/ui-workspace/tests/tree.client.spec.ts b/packages/client/ui-workspace/tests/tree.client.spec.ts
+index 9fb549c..af95e8d 100644
+--- a/packages/client/ui-workspace/tests/tree.client.spec.ts
++++ b/packages/client/ui-workspace/tests/tree.client.spec.ts
+@@ -353,11 +353,17 @@ describe('deriveGroups', () => {
+       view(['first']),
+     )
+ 
+-    expect(groups[0]!.sessions.map(node => node.id)).toEqual([parent.id, fork.id])
++    // Catalog children render inline after their parent; the group's own count
++    // stays on top-level members.
++    expect(groups[0]!.sessions.map(node => node.id)).toEqual([
++      parent.id, 'subagent', 'inactive-child', fork.id, 'fork-child',
++    ])
+     expect(groups[0]!.sessionCount).toBe(2)
+-    expect(groups[0]!.sessions[0]).toMatchObject({ running: false, runningSubagentCount: 1 })
+-    expect(groups[0]!.sessions[1]).toMatchObject({ running: false, runningSubagentCount: 1 })
++    expect(groups[0]!.sessions[0]).toMatchObject({ running: false, runningSubagentCount: 1, childCount: 2 })
++    expect(groups[0]!.sessions[1]).toMatchObject({ running: true, runningSubagentCount: 0, childOf: parent.id })
++    expect(groups[0]!.sessions[3]).toMatchObject({ running: false, runningSubagentCount: 1, childCount: 1 })
+     expect(deriveFlat(sessions, visibleSessionIds(sessions, noArchive, 'default'), noRows, noAttention)
++      .filter(node => node.childOf === undefined)
+       .map(node => [node.id, node.runningSubagentCount])).toEqual([
+       [parent.id, 1], [fork.id, 1],
+     ])
+diff --git a/packages/client/ui-workspace/tests/workspace-browser.client.spec.tsx b/packages/client/ui-workspace/tests/workspace-browser.client.spec.tsx
+index 4b62826..db8bacf 100644
+--- a/packages/client/ui-workspace/tests/workspace-browser.client.spec.tsx
++++ b/packages/client/ui-workspace/tests/workspace-browser.client.spec.tsx
+@@ -16,7 +16,7 @@ import { zh as commonZh } from '@deepseek-ai/dsh-client-locale/src/locales/zh.ts
+ import type { DirectoryFlowOwnerProps, WorkspaceBrowserProps } from '../src/client/contract/slots.ts'
+ import { createWorkspaceShortcutControls } from '../src/client/shortcuts.ts'
+ import { createWorkspaceViewStore, FLAT_SESSION_ORDER_KEY } from '../src/client/stores.ts'
+-import { UNGROUPED_KEY } from '../src/client/tree.ts'
++import { UNGROUPED_KEY, childRowsKey } from '../src/client/tree.ts'
+ import { WorkspaceBrowser } from '../src/client/rows/WorkspaceBrowser.tsx'
+ import { zh } from '../src/client/locales.ts'
+ 
+@@ -833,6 +833,60 @@ describe('WorkspaceBrowser', () => {
+     expect(screen.getByRole('button', { name: '展开其余 4 个会话' })).toBeTruthy()
+   })
+ 
++  it('keeps a folded parent inside the watermark while its child Session is selected', () => {
++    // The parent ranks 12th of 13 by recency, far past the base watermark of 5,
++    // and its child row is folded away: nothing in the derived rows names the
++    // selected child, so the parent slot can only be recognised from the catalog.
++    const parent = summary('parent', 10, { title: 'parent' })
++    const child = summary('child', 5, { origin: 'subagent' as const, parentId: parent.id, title: 'child' })
++    const others = Array.from({ length: 11 }, (_, index) => summary(`session-${index + 1}`, 100 - index))
++    const sentinel = summary('sentinel', 1)
++    const preferences = createWorkspaceViewStore().create()
++    preferences.actions.setGroupExpanded('alpha', true)
++    preferences.actions.setGroupExpanded(childRowsKey(parent.id), false)
++    mount({
++      useSessions: hook(sessionState([...others, parent, child, sentinel], {
++        main: child.id,
++        projectionsBySession: {
++          [parent.id]: {
++            values: { subagentCatalog: [{ id: child.id, mode: 'continuable', label: 'child', createdAt: 1 }] },
++            state: 'ready',
++            error: null,
++          },
++        },
++      })),
++      useWorkspaces: hook(workspaceState([workspace('alpha', [parent.id, child.id, ...others.map(item => item.id), sentinel.id])])),
++    })
++    // Folded: the child row never renders, so the parent row is the only trace.
++    expect(screen.queryByText('child')).toBeNull()
++    expect(screen.getByText('parent')).toBeTruthy()
++    // The raise stops at the parent's slot: everything above it shows and the
++    // oldest row stays behind "Show more".
++    expect(screen.getByText('session-11')).toBeTruthy()
++    expect(screen.queryByText('sentinel')).toBeNull()
++    expect(screen.getByRole('button', { name: '展开其余 1 个会话' })).toBeTruthy()
++  })
++
++  it('leaves that folded parent past the watermark when no catalog lists the selected Session', () => {
++    // Negative control for the case above: without the catalog, nothing ties the
++    // selected child to a parent slot, so the base watermark hides it exactly as
++    // it did before the catalog lookup existed.
++    const parent = summary('parent', 10, { title: 'parent' })
++    const child = summary('child', 5, { origin: 'subagent' as const, parentId: parent.id, title: 'child' })
++    const others = Array.from({ length: 11 }, (_, index) => summary(`session-${index + 1}`, 100 - index))
++    const sentinel = summary('sentinel', 1)
++    const preferences = createWorkspaceViewStore().create()
++    preferences.actions.setGroupExpanded('alpha', true)
++    preferences.actions.setGroupExpanded(childRowsKey(parent.id), false)
++    mount({
++      useSessions: hook(sessionState([...others, parent, child, sentinel], { main: child.id })),
++      useWorkspaces: hook(workspaceState([workspace('alpha', [parent.id, child.id, ...others.map(item => item.id), sentinel.id])])),
++    })
++    expect(screen.queryByText('parent')).toBeNull()
++    expect(screen.queryByText('session-6')).toBeNull()
++    expect(screen.getByRole('button', { name: '展开其余 8 个会话' })).toBeTruthy()
++  })
++
+   it('stops automatic raises at 50 rows while Show more continues past them', () => {
+     const items = Array.from({ length: 60 }, (_, index) => summary(`session-${index + 1}`, 60 - index))
+     const b = mount({
+@@ -883,7 +937,8 @@ describe('WorkspaceBrowser', () => {
+     fireEvent.click(screen.getByText('alpha'))
+     expect(screen.getByText('session-7')).toBeTruthy()
+     expect(screen.queryByText('session-8')).toBeNull()
+-    expect(screen.queryByText('child')).toBeNull()
++    // The running child renders as an indented row under its parent's slot.
++    expect(screen.getByText('child')).toBeTruthy()
+     rerender(b, { useSessions: hook(sessionState(items, { main: sid('session-8') })) })
+     expect(screen.getByText('session-8')).toBeTruthy()
+     expect(screen.queryByText('session-9')).toBeNull()
+diff --git a/packages/client/ui-workspace/README.md b/packages/client/ui-workspace/README.md
+index f630f0f..6ac9091 100644
+--- a/packages/client/ui-workspace/README.md
++++ b/packages/client/ui-workspace/README.md
+@@ -11,7 +11,7 @@ Desktop product events use the optional [product analytics service](../product-a
+ 
+ ## Summary
+ 
+-This package lets users browse grouped or flat Session lists, choose a Workspace for a new Session, and manage Workspaces and Sessions through add, rename, reorder, search, fork, archive, and Workspace deletion; the Session row menu and its hover buttons are slot lists that client plugins extend. Pending interactions appear as warning dots, and subagent-origin Sessions remain hidden. An idle, unarchived Session row with active scheduled tasks shows a clock mark, and its hover card lists those tasks. Canonically distinct folder paths remain separate Workspaces. Adding a Workspace requires a composed directory picker; without one, adding is unavailable.
++This package lets users browse grouped or flat Session lists, choose a Workspace for a new Session, and manage Workspaces and Sessions through add, rename, reorder, search, fork, archive, and Workspace deletion; the Session row menu and its hover buttons are slot lists that client plugins extend. Pending interactions appear as warning dots, and subagent-origin Sessions appear as indented child rows under their parent, folded by a per-parent toggle. An idle, unarchived Session row with active scheduled tasks shows a clock mark, and its hover card lists those tasks. Canonically distinct folder paths remain separate Workspaces. Adding a Workspace requires a composed directory picker; without one, adding is unavailable.
+ 
+ ## Table of Contents
+ 
+@@ -53,7 +53,7 @@ Collapsed search is one header action beside the view and add actions: activatin
+ 
+ The final built-in item in a Session row's "..." menu is Copy Session ID. It closes the menu and copies the complete ID directly, without opening a dialog. Clipboard success or failure appears in the global toast; a failed copy can be retried from the menu. Copying does not retain the Session, load its history, or call the Host.
+ 
+-The Session row's Rename action opens a dialog prefilled with the row's display title; confirming an unchanged title is deliberately allowed — it pins the current automatic title against regeneration. Double-clicking a title also opens Rename; for an unarchived Session, the preceding clicks open its conversation. Rename uses a temporary `workspaceOperation` reference and awaits its initial history opening. The row's Fork action reads ordinary cold history normally. When the Host reports that source migration is required, an app-wide Toast offers to open that Session; the action only navigates and does not retry fork. A successful fork uses the source's last completed turn and increments the inherited persisted title through Session Controller without retaining the child, opening its history, or changing selection. Workspace Delete opens a confirmation that states the retention boundary; success removes the group while its Sessions remain under Ungrouped. Pin, Rename, Fork, Archive, and Copy Session ID are themselves entries of the `sidebar.workspaces.session.menu.item` list (pin and archive also of `sidebar.workspaces.session.row.action`), so a client plugin's action takes whatever position its `order` gives it.
++The Session row's Rename action opens a dialog prefilled with the row's display title; confirming an unchanged title is deliberately allowed — it pins the current automatic title against regeneration. Double-clicking a title also opens Rename, except on a subagent child row, which has no rename gesture (see View state); for an unarchived Session, the preceding clicks open its conversation. Rename uses a temporary `workspaceOperation` reference and awaits its initial history opening. The row's Fork action reads ordinary cold history normally. When the Host reports that source migration is required, an app-wide Toast offers to open that Session; the action only navigates and does not retry fork. A successful fork uses the source's last completed turn and increments the inherited persisted title through Session Controller without retaining the child, opening its history, or changing selection. Workspace Delete opens a confirmation that states the retention boundary; success removes the group while its Sessions remain under Ungrouped. Pin, Rename, Fork, Archive, and Copy Session ID are themselves entries of the `sidebar.workspaces.session.menu.item` list (pin and archive also of `sidebar.workspaces.session.row.action`), so a client plugin's action takes whatever position its `order` gives it.
+ 
+ Archive commits without a confirmation dialog for a quiet Session and retains the Session's account position. A Session with running work is the one case that asks first: the Host refuses the plain archive and names that work, and the sidebar opens a stop-and-archive dialog listing it by family — the turn in progress, running subagents, background jobs, scheduled reminders, each with its labels — with the restore path stated; confirming asks the Host to stop the work the way the stop button does and archives once the archive set is durable, while the stops settle in the background, and cancelling leaves the Session running and visible. View options control visibility through one explicit three-way choice: Hide archived (the default) hides archived Sessions, All conversations (show archived) includes them, and Archived only hides ordinary Sessions and drops Workspaces without an archived Session; in tree grouping, children of a dropped Workspace nest under the nearest shown ancestor. Visible archived rows are grayed and carry an accessible explanation that they cannot be opened until restored; Rename, Fork, and Unarchive remain available. A successful archive shows a notice with an undo action and — while archived rows are hidden — a "filter archived sessions" action that switches the filter to All conversations (show archived); a stop-and-archive shows the same notice under its own wording, and undo restores the Session without resuming the stopped work. Unarchive removes the archive mark without restoring a pin or changing the saved position. An empty list shows a centered glyph-over-text placeholder; the Archived-only view names its own emptiness (No archived sessions yet) and adds a View other sessions text action that switches the filter back to Hide archived.
+ 
+@@ -101,9 +101,9 @@ Each registration declares a **directory-flow child hole** (`single` kind: `conv
+ 
+ ### Session row actions
+ 
+-The Session row's "..." menu and its hover buttons are two `list` slots declared by the WorkspaceBrowser entry: `sidebar.workspaces.session.menu.item` and `sidebar.workspaces.session.row.action`. Every menu row and every hover button is an entry, this package's own actions included: `apply` registers `pin` (menu 100, button 200), `rename` (200), `fork` (300), `archive` (menu 400, button 100), and `session-id` (450) the way a client plugin registers its actions, so a plugin action lands wherever its `order` says, and reusing a shipped id at another `priority` shadows that action.
++The Session row's "..." menu and its hover buttons are two `list` slots declared by the WorkspaceBrowser entry: `sidebar.workspaces.session.menu.item` and `sidebar.workspaces.session.row.action`. Every menu row and every hover button is an entry, this package's own actions included: `apply` registers `pin` (menu 100, button 200), `rename` (200), `fork` (300), `archive` (menu 400, button 100), and `session-id` (450) the way a client plugin registers its actions, so a plugin action lands wherever its `order` says, and reusing a shipped id at another `priority` shadows that action. A subagent child row asks for neither list while it is live and for exactly one of them once it is archived: only `sidebar.workspaces.session.row.action` renders there, where the archive entry is the restore button.
+ 
+-An entry receives only the row identity (`sessionId`, `displayTitle`) and owns everything else. It reads the Host state it cares about through its own injected hooks (the pin and archive sets, as Sets derived once per Workspace snapshot), decides its own visibility (pin renders nothing on an archived row, because the Host keeps the two sets exclusive, and fork renders nothing when `useSessionAccess(sessionId, 'session/fork')` is false), carries its whole behavior in its registration's `inject` face (a pin also fronts the Session in its saved orders; an archive raises the notice), and raises its own surfaces: the rename dialog, the stop-and-archive dialog, and the row-action notice are this package's `shell.overlay` entries, fed by the requests the actions inject. A menu entry renders one `role="menuitem"` button (this package's rows use `MenuItemButton` from ui-primitives, which adds the host styling and `separatorBefore` for a group start; the hairline comes and goes with the row) and dismisses the menu through the slot-level `useMenuOpenState` hook, the menu's own open state bound from the row's render occurrence; a hover button entry renders one icon button, and the strip keeps its clicks from opening the row. The browser passes no action callbacks to its rows; its remaining verbs are the search results' restore button and the title double-click, which raises the same rename request.
++An entry receives only the row identity (`sessionId`, `displayTitle`) and owns everything else. It reads the Host state it cares about through its own injected hooks (the pin and archive sets, as Sets derived once per Workspace snapshot), decides its own visibility (pin renders nothing on an archived row, because the Host keeps the two sets exclusive, and fork renders nothing when `useSessionAccess(sessionId, 'session/fork')` is false), carries its whole behavior in its registration's `inject` face (a pin also fronts the Session in its saved orders; an archive raises the notice), and raises its own surfaces: the rename dialog, the stop-and-archive dialog, and the row-action notice are this package's `shell.overlay` entries, fed by the requests the actions inject. A menu entry renders one `role="menuitem"` button (this package's rows use `MenuItemButton` from ui-primitives, which adds the host styling and `separatorBefore` for a group start; the hairline comes and goes with the row) and dismisses the menu through the slot-level `useMenuOpenState` hook, the menu's own open state bound from the row's render occurrence; a hover button entry renders one icon button, and the strip keeps its clicks from opening the row. The browser passes no action callbacks to its rows; its remaining verbs are the search results' restore button and the title double-click, which raises the same rename request. Neither reaches a subagent child row: its title double-click is off, and its archived strip renders only the entries an archived row still shows, which is the archive entry acting as its restore button.
+ 
+ The existing notice overlay dispatches `workspace.toast` by notice kind. Keyed registrations inject localized display mappings and their own actions; only archive notices subscribe to the viewing filter. They render the package-local `workspace.toast.content` Factory, which reuses the Toast primitive once for all presentations. The existing notice state, display sequence, latest-notice replacement, and dismissal remain shared; locale or filter changes do not restart the same notice's timer.
+ 
+@@ -176,9 +176,9 @@ A dynamically loaded browser half follows the same component contract; which mod
+ 
+ ### View state
+ 
+-Once the Workspace baseline is ready, browser-persisted expansion and Session-order records retain only current Workspace ids plus Ungrouped and the flat-list account. `WorkspaceView.sessionIds` supplies real-Workspace membership, not Session display order. View actions receive complete account orders, never filtered rows. A new member without a Session summary waits for that summary, while a saved position survives a temporarily missing summary. Archive visibility is applied only when deriving rows. Pin and drag writes save complete orders; ordinary derivation does not write them. The selected blank Session remains an explicit position write, including during Workspace reconnection, when other saved members are retained until the baseline establishes membership. Ordering remains mounted while the sidebar is a rail or search replaces its body. Last updated derives from current summaries without reading saved positions; equal timestamps use Session ids as a stable tie-break.
++Once the Workspace baseline is ready, browser-persisted expansion and Session-order records retain only current Workspace ids plus Ungrouped and the flat-list account; the same cleanup keeps every `session:<parentId>` child-fold key, capped at the 200 most recently recorded, so the earliest folds drop once a view passes that bound. `WorkspaceView.sessionIds` supplies real-Workspace membership, not Session display order. View actions receive complete account orders, never filtered rows. A new member without a Session summary waits for that summary, while a saved position survives a temporarily missing summary. Archive visibility is applied only when deriving rows. Pin and drag writes save complete orders; ordinary derivation does not write them. The selected blank Session remains an explicit position write, including during Workspace reconnection, when other saved members are retained until the baseline establishes membership. Ordering remains mounted while the sidebar is a rail or search replaces its body. Last updated derives from current summaries without reading saved positions; equal timestamps use Session ids as a stable tie-break.
+ 
+-The sidebar hides durable summaries with `origin: 'subagent'`. A visible ordinary row shows the shared ongoing loader from running direct children in its loaded parent catalog, never from summary lineage. Child activity uses the latest UI status, falling back to the Session summary until that status is known.
++The sidebar hides durable summaries with `origin: 'subagent'` as top-level rows, but a Session with a loaded subagent catalog lists those children inline: each child follows its parent's row, indented one step, titled by the mirrored Session title (so a title set outside this list shows there), then the catalog label, then the id's short form. A parent row with children carries a fold toggle keyed `session:<parentId>` in `groupExpansion`; a fold defaults to expanded, and a folded parent renders no child rows. Child rows take no place in the watermark or drag order and carry no row menu, and they follow the archive filter, with one exception: an archived parent keeps its children closed under Hide archived and All conversations, because the archived-only view is where an archived parent lists its archived children. A selected child Session keeps its folded parent inside the watermark, and an archived child row renders only its restore strip. A visible ordinary row shows the shared ongoing loader from running direct children in its loaded parent catalog, never from summary lineage. Child activity uses the latest UI status, falling back to the Session summary until that status is known.
+ 
+ Row motion belongs to [AnimatedRows](src/client/rows/AnimatedRows.tsx). It measures keyed rows before and after React commits that change their membership or order, and uses native movement and opacity animations. Removed rows fade as inert copies outside the scrolling list; they do not delay React unmounting or extend its scroll range. Initial loading, drag commits, overflow expansion, and view-option changes settle immediately. The animator has no layout observers or polling and does not measure content-only updates or scrolling.
+ 
+diff --git a/packages/client/ui-workspace/README.i18n.yaml b/packages/client/ui-workspace/README.i18n.yaml
+index 469aa0c..5197211 100644
+--- a/packages/client/ui-workspace/README.i18n.yaml
++++ b/packages/client/ui-workspace/README.i18n.yaml
+@@ -9,8 +9,8 @@
+   en: b286adf3aca51710
+   zh: 6122f6e7c8015197
+ /deepseek-ai-dsh-client-ui-workspace/summary:
+-  en: 1a76ace6a18e3ab5
+-  zh: b274d1e98e133851
++  en: 538fe269dcbee70e
++  zh: c46a2affb22eb34d
+ /deepseek-ai-dsh-client-ui-workspace/table-of-contents:
+   en: d152484eb41ac6b4
+   zh: 09388d293f9be9cb
+@@ -27,8 +27,8 @@
+   en: 9eab3bfbaf98c987
+   zh: 54e7e141dae5c9e8
+ /deepseek-ai-dsh-client-ui-workspace/use-this-package/managing-sessions:
+-  en: e96b714aeb6dcd03
+-  zh: 75b63aa2cafbb57a
++  en: 45aa75d3464eb5ae
++  zh: d546125903a53487
+ /deepseek-ai-dsh-client-ui-workspace/use-this-package/pending-interactions:
+   en: 9fb88260380bf093
+   zh: 3bace2b96ecd4a82
+@@ -42,8 +42,8 @@
+   en: 868904dbfb5713f8
+   zh: 225906bfef7398bf
+ /deepseek-ai-dsh-client-ui-workspace/understand-the-implementation/session-row-actions:
+-  en: 5bbba6e462faf3dc
+-  zh: 4734263208ee07c9
++  en: bab1a5cc6afa06fa
++  zh: 7489827efa09b6d8
+ /deepseek-ai-dsh-client-ui-workspace/understand-the-implementation/session-row-actions/packaged-client-plugin:
+   en: 36934671b80b11ae
+   zh: 8e0aea6162e35e77
+@@ -51,8 +51,8 @@
+   en: ad4a333892f2fe92
+   zh: 3a670fd401f4d7a7
+ /deepseek-ai-dsh-client-ui-workspace/understand-the-implementation/view-state:
+-  en: 83031e7505fc228a
+-  zh: 03e17c9428fe29fd
++  en: d06b6713c2007e23
++  zh: 75ff82b900d62d51
+ /deepseek-ai-dsh-client-ui-workspace/understand-the-implementation/hover-cards:
+   en: ea89ec5a3ee1f167
+   zh: e11f350571bcfff7

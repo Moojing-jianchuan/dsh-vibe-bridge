@@ -1,0 +1,10 @@
+node_modules/
+*.log
+.DS_Store
+# Local state written by the plugin, never committed
+.vibe-bridge/
+# Build/scratch output of the maintenance scripts
+.apply-*/
+*.tmp
+*.patch.rej
+*.patch.orig

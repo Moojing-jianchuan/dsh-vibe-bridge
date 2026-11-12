@@ -1,0 +1,35 @@
+NOTICE
+
+dsh-vibe-bridge
+
+This project is a plugin for DeepSeek Harness (DSH), which is distributed under
+the MIT License:
+
+    DeepSeek Harness — https://github.com/deepseek-ai/deepseek-harness
+    Copyright (c) DeepSeek
+    Licensed under the MIT License.
+
+Third-party material in this repository
+---------------------------------------
+
+1. `tools/source-patch/nested-sessions.patch` is a unified diff against DSH
+   source files (`packages/client/ui-workspace/src/...`). The diff text itself is
+   authored here, but the context lines it carries quote DSH source code and are
+   therefore covered by the DSH MIT license above. The patch is applied by the
+   user to a checkout of that project; this repository does not redistribute DSH
+   source files or DSH build artifacts.
+
+2. `tools/legacy-dist-patch.mjs` is a structural patcher that rewrites a copy of
+   the DSH client bundle *on the user's own machine*. No DSH build output is
+   committed to or distributed from this repository.
+
+3. Runtime dependencies are not vendored. The plugin declares
+   `@deepseek-ai/*` packages as peer dependencies and resolves them from the
+   user's own DSH installation (see `tools/dev-link.mjs` and
+   `tools/install.mjs`).
+
+Trademarks
+----------
+
+"DeepSeek" and "DeepSeek Harness" are used only to describe compatibility.
+This project is not published, endorsed, or supported by DeepSeek.
