@@ -141,11 +141,12 @@ node /path/to/dsh-vibe-bridge/tools/install-bundle.mjs \
 node /path/to/dsh-vibe-bridge/tools/install-bundle.mjs --restore --dsh-node-modules "…"
 ```
 
-What the patch implements (6 source files, 3 test files, plus README and its i18n record):
+What the patch implements (7 source files, 3 test files, plus README and its i18n record):
 
 - child rows render indented under their parent, titled by the live session title → catalog label → id short form;
 - a per-parent fold toggle keyed `session:<parentId>`, **expanded by default**, accessible name from the locale dictionary;
-- child rows take no watermark slot, cannot be dragged, carry no row menu, and cannot be renamed by double-click;
+- child rows take no watermark slot and cannot be dragged;
+- **child rows carry exactly one row verb — archive or restore** — through its own list slot (`sidebar.workspaces.session.childRow.action`). They render no menu, so rename, pin, and fork never target them, and the ordinary row-action list stays off them so a pin entry cannot reach a row it cannot pin. Archiving a running child still routes through the Host's stop-and-archive confirmation;
 - the archive filter applies to them exactly as to parents, with one deliberate exception: the *archived only* view still lists an archived parent's archived children, because that view is where archived sessions are recovered;
 - selecting a child keeps its parent inside the watermark even while collapsed.
 

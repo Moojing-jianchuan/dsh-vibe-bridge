@@ -140,11 +140,12 @@ node /path/to/dsh-vibe-bridge/tools/install-bundle.mjs \
 node /path/to/dsh-vibe-bridge/tools/install-bundle.mjs --restore --dsh-node-modules "…"
 ```
 
-补丁到底做了什么（6 个源码文件 + 3 个测试文件，外加 README 及其 i18n 记录）：
+补丁到底做了什么（7 个源码文件 + 3 个测试文件，外加 README 及其 i18n 记录）：
 
 - 子行缩进挂在父行正下方，标题优先取**实时**会话标题（重命名立即生效）→ catalog label → id 前 8 位；
 - 每个父行一个折叠键 `session:<parentId>`，**默认展开**，可访问名走 locale 字典；
-- 子行不占水位线、不可拖拽、不显示行菜单、双击不改名；
+- 子行不占水位线、不可拖拽；
+- **子行只带一个行动作：归档 / 恢复**，走它自己的列表槽 `sidebar.workspaces.session.childRow.action`。子行不渲染菜单，所以重命名、pin、fork 都不会落到它身上；普通行的 action 列表也不渲染给子行，避免 pin 按钮出现在点不动的行上。归档正在跑的子会话仍会走"先停再归档"确认；
 - 归档过滤器对子行与父行一视同仁，唯一例外是「仅归档」视图仍列出归档父行的归档子行 —— 因为那个视图正是恢复归档会话的入口；
 - 选中的是子行时，它的父行会被算作注意力目标，即使父行处于折叠状态也不会被水位线裁掉。
 

@@ -1,3 +1,109 @@
+diff --git a/packages/client/ui-workspace/src/client/contract/slots.ts b/packages/client/ui-workspace/src/client/contract/slots.ts
+index d00b365..cec0546 100644
+--- a/packages/client/ui-workspace/src/client/contract/slots.ts
++++ b/packages/client/ui-workspace/src/client/contract/slots.ts
+@@ -187,6 +187,13 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
+      * handling to keep the row from opening.
+      */
+     'sidebar.workspaces.session.row.action': { kind: 'list'; scope: 'root'; owner: SessionRowOwnerProps }
++    /**
++     * The row verbs a parent's subagent child rows may carry. Child rows render
++     * no menu, so a verb that acts on the Session's own slot or account position
++     * (rename, pin, fork) cannot apply; entries registered here reach only rows
++     * the catalog placed under a parent. The shipped entry is archive-or-restore.
++     */
++    'sidebar.workspaces.session.childRow.action': { kind: 'list'; scope: 'root'; owner: SessionRowOwnerProps }
+   }
+ }
+ 
+@@ -471,6 +478,7 @@ export type WorkspaceBrowserProps =
+     | 'sidebar.workspaces.directoryFlow'
+     | 'sidebar.workspaces.session.menu.item'
+     | 'sidebar.workspaces.session.row.action'
++    | 'sidebar.workspaces.session.childRow.action'
+     | 'sidebar.session.row.leading'
+     | 'sidebar.session.row.hover'
+   >
+diff --git a/packages/client/ui-workspace/src/client/index.ts b/packages/client/ui-workspace/src/client/index.ts
+index cc9da07..f19d3dd 100644
+--- a/packages/client/ui-workspace/src/client/index.ts
++++ b/packages/client/ui-workspace/src/client/index.ts
+@@ -190,28 +190,31 @@ export function apply(ctx: Context): void {
+       uiWorkspace.unpinSession(sessionId).catch(() => { notify({ kind: 'unpinFailed' }) })
+     },
+   })
++  // Archive preserves the log and the account position, so a quiet Session
++  // needs no confirmation; the notice offers undo and the archived filter.
++  // The Host's refusal for running work is the one case that asks first:
++  // the confirmation names that work and offers to stop it. Shared by the row
++  // action slot and by a parent's child rows, which carry the same entry
++  // without the pin and fork verbs.
++  const archiveSession = (sessionId: SessionId): void => {
++    uiWorkspace.archiveSession(sessionId).then(() => {
++      notify({ kind: 'archived', sessionId })
++    }).catch((reason: unknown) => {
++      const activity = activeSessionRefusal(reason)
++      if (activity === undefined) {
++        console.warn('session archive rejected:', reason)
++        return
++      }
++      const displayTitle = sessions.list.getSnapshot().byId[sessionId]?.displayTitle ?? sessionId
++      archiveRequest.set({ sessionId, displayTitle, activity })
++    })
++  }
+   const archiveInjected = (): ArchiveSessionInjected => ({
+     hooks: { archived: archivedSet },
+-    // Archive preserves the log and the account position, so a quiet Session
+-    // needs no confirmation; the notice offers undo and the archived filter.
+-    // The Host's refusal for running work is the one case that asks first:
+-    // the confirmation names that work and offers to stop it.
+-    archiveSession: (sessionId) => {
+-      uiWorkspace.archiveSession(sessionId).then(() => {
+-        notify({ kind: 'archived', sessionId })
+-      }).catch((reason: unknown) => {
+-        const activity = activeSessionRefusal(reason)
+-        if (activity === undefined) {
+-          console.warn('session archive rejected:', reason)
+-          return
+-        }
+-        const displayTitle = sessions.list.getSnapshot().byId[sessionId]?.displayTitle ?? sessionId
+-        archiveRequest.set({ sessionId, displayTitle, activity })
+-      })
+-    },
++    archiveSession,
+     unarchiveSession,
+   })
+-  installWorkspaceShortcuts(ctx, uiWorkspace, shortcutControls, archiveInjected().archiveSession,
++  installWorkspaceShortcuts(ctx, uiWorkspace, shortcutControls, archiveSession,
+     (reason) => { notify({ kind: 'shortcutForkFailed', reason }) })
+   const archiveConfirmInjected = (): SessionArchiveConfirmInjected => ({
+     hooks: { archiveRequest },
+@@ -301,6 +304,7 @@ export function apply(ctx: Context): void {
+           kind: 'list', scope: 'root', inject: { hooks: { menuOpenState: menuOpenStateFactory, shortcuts: ctx.shortcuts.catalog } },
+         },
+         'sidebar.workspaces.session.row.action': { kind: 'list', scope: 'root' },
++        'sidebar.workspaces.session.childRow.action': { kind: 'list', scope: 'root' },
+         'sidebar.session.row.leading': { kind: 'list', scope: 'root' },
+         'sidebar.session.row.hover': { kind: 'list', scope: 'root' },
+       },
+@@ -324,6 +328,17 @@ export function apply(ctx: Context): void {
+     yield ctx.slots.register({ name: 'sidebar.workspaces.session.row.action', id: 'archive', order: 100, locale: NS, inject: archiveInjected }, ArchiveSessionRowButton)
+     yield ctx.slots.register({ name: 'sidebar.workspaces.session.row.action', id: 'pin', order: 200, locale: NS, inject: pinInjected }, PinSessionRowButton)
+   })
++  // Child rows carry the archive verb alone: the same component and the same
++  // injected behavior, in a list a pin or fork entry cannot reach.
++  ctx.slots.inject('sidebar.workspaces.session.childRow.action', function* () {
++    yield ctx.slots.register({
++      name: 'sidebar.workspaces.session.childRow.action',
++      id: 'archive',
++      order: 100,
++      locale: NS,
++      inject: archiveInjected,
++    }, ArchiveSessionRowButton)
++  })
+   // The surfaces the actions raise live in the frame-wide layer: they must
+   // outlive the row menu the action sat in.
+   ctx.slots.inject('shell.overlay', function* () {
 diff --git a/packages/client/ui-workspace/src/client/locales.ts b/packages/client/ui-workspace/src/client/locales.ts
 index 0214ab9..708bc11 100644
 --- a/packages/client/ui-workspace/src/client/locales.ts
@@ -64,10 +170,43 @@ index 6d35a23..3a61c4f 100644
    margin: 0 6px 0 4px;
  }
 diff --git a/packages/client/ui-workspace/src/client/rows/Rows.tsx b/packages/client/ui-workspace/src/client/rows/Rows.tsx
-index 216a6fc..6b135a6 100644
+index 216a6fc..99cfaaf 100644
 --- a/packages/client/ui-workspace/src/client/rows/Rows.tsx
 +++ b/packages/client/ui-workspace/src/client/rows/Rows.tsx
-@@ -334,6 +334,39 @@ function assertNever(value: never): never {
+@@ -1,5 +1,5 @@
+ /**
+- * Workspace browser tree row components (figma Cell set 14:3080): pure presentational —
++ * Workspace browser tree row components (figma Cell set 14:3080): pure presentational 闁?
+  * all data and callbacks arrive via props. Hover swaps (folder->chevron,
+  * time->ellipsis, action buttons) are CSS-only, and a session row's clipped
+  * title marquees programmatically while the row is hovered. Workspace row
+@@ -40,6 +40,7 @@ type RowTranslate = WorkspaceBrowserProps['t']
+ type RowRenderSlots = PropsRenderSlots<
+   | 'sidebar.workspaces.session.menu.item'
+   | 'sidebar.workspaces.session.row.action'
++  | 'sidebar.workspaces.session.childRow.action'
+   | 'sidebar.session.row.leading'
+   | 'sidebar.session.row.hover'
+ >['renderSlot']
+@@ -92,7 +93,7 @@ function restTitle(title: HTMLSpanElement): void {
+  * title clips its own text, so entering crawls it at a constant speed until the
+  * far edge (a fork's incremented title, for example) is in view, then rests
+  * there under the pointer. Overflow of at most {@link MIN_TITLE_REVEAL_PX}
+- * stays put — a barely-clipped title moving a few pixels reads as jitter, not a
++ * stays put 闁?a barely-clipped title moving a few pixels reads as jitter, not a
+  * reveal. Leaving returns the title to the start in one step, because the
+  * resting ellipsis and the narrowed cell would otherwise meet the text while it
+  * travelled back. Reduced motion jumps to the far edge instead of crawling.
+@@ -133,7 +134,7 @@ function useTitleMarquee(title: RefObject<HTMLSpanElement | null>): { enter: ()
+   }), [title])
+ }
+ 
+-/** Localized compact relative time ("刚刚"/"5分钟" in zh, "now"/"5min" in en). */
++/** Localized compact relative time ("闁告帗鑹鹃崹?/"5闁告帒妫濋幐? in zh, "now"/"5min" in en). */
+ function timeLabel(updatedAt: number, now: number, t: RowTranslate): string {
+   const { unit, n } = relativeTime(updatedAt, now)
+   return unit === 'now' ? t('time.now') : t(`time.${unit}`, { n })
+@@ -334,6 +335,39 @@ function assertNever(value: never): never {
    throw new Error(`unknown pending interaction: ${String(value)}`)
  }
  
@@ -107,12 +246,21 @@ index 216a6fc..6b135a6 100644
  interface SessionStatus {
    state: StateDotState
    label: string
-@@ -523,13 +556,14 @@ export function SearchResultItem({ result, currentId, onOpen, onUnarchive, t }:
+@@ -489,7 +523,7 @@ export function SearchResultItem({ result, currentId, onOpen, onUnarchive, t }:
+     >
+       <span className={css.searchResultHeading}>
+         {/* Like session rows, the leading slot owns every row marker; on
+-            archived rows it stays blank — the grayed row carries the
++            archived rows it stays blank 闁?the grayed row carries the
+             archived look. */}
+         <span className={css.slot}>
+           {!result.archived && primaryStatus.state !== 'idle' && (
+@@ -523,13 +557,14 @@ export function SearchResultItem({ result, currentId, onOpen, onUnarchive, t }:
  }
  
  /**
 - * One top-level 32px session row: leading 16px cell (status dot, or the
-+ * One 32px session row — a top-level row, or a parent's indented subagent
++ * One 32px session row 闁?a top-level row, or a parent's indented subagent
 + * child row below it: leading 16px cell (status dot, or the
   * leading seat while the row's primary state is idle), title, relative time or
   * compact pending label, and the row actions menu. A row that owns a state dot
@@ -124,7 +272,7 @@ index 216a6fc..6b135a6 100644
   * @param props.currentId - selected session id (row highlight).
   * @param props.now - epoch ms for relative-time formatting.
   * @param props.onOpen - open a session by id.
-@@ -538,12 +572,13 @@ export function SearchResultItem({ result, currentId, onOpen, onUnarchive, t }:
+@@ -538,12 +573,13 @@ export function SearchResultItem({ result, currentId, onOpen, onUnarchive, t }:
   * (`sidebar.workspaces.session.menu.item` / `sidebar.workspaces.session.row.action`),
   * its leading decoration, and its hover-card section.
   * @param props.onReveal - scroll this row into view after search navigation, then acknowledge it.
@@ -140,7 +288,7 @@ index 216a6fc..6b135a6 100644
  }: {
    node: SessionNode
    currentId: string | undefined
-@@ -553,6 +588,8 @@ export function SessionNodeItem({
+@@ -553,12 +589,15 @@ export function SessionNodeItem({
    onRenameRequest: (id: SessionNode['id'], currentTitle: string) => void
    /** Scroll this row into view after search navigation, then acknowledge it. */
    onReveal?: (() => void) | undefined
@@ -149,7 +297,14 @@ index 216a6fc..6b135a6 100644
    /** Present on reorderable-list rows so every row can remain a drop target. */
    drag?: RowDragProps | undefined
    t: RowTranslate
-@@ -570,8 +607,9 @@ export function SessionNodeItem({
+ } & PropsRenderSlots<
+   | 'sidebar.workspaces.session.menu.item'
+   | 'sidebar.workspaces.session.row.action'
++  | 'sidebar.workspaces.session.childRow.action'
+   | 'sidebar.session.row.leading'
+   | 'sidebar.session.row.hover'
+ >) {
+@@ -570,8 +609,9 @@ export function SessionNodeItem({
    const showStatus = primaryStatus.state !== 'idle'
    // Archived rows hold their in-place grayed slot, so manual reorder cannot
    // move them. Pinned rows drag within the pinned block: the browser gates
@@ -161,7 +316,7 @@ index 216a6fc..6b135a6 100644
    const [menuOpen, setMenuOpen] = useState(false)
    // The menu's open state, bound into the row entries' `useMenuOpenState` hook.
    const menuOpenState = useMemo((): MenuOpenState => [menuOpen, setMenuOpen], [menuOpen])
-@@ -588,6 +626,7 @@ export function SessionNodeItem({
+@@ -588,6 +628,7 @@ export function SessionNodeItem({
      <div
        ref={rowRef}
        data-row-key={`session:${node.id}`}
@@ -169,7 +324,15 @@ index 216a6fc..6b135a6 100644
        className={clsx(
          css.sessionRow, selected && css.selected, menuOpen && css.menuOpen,
          row.archived && css.archived,
-@@ -634,10 +673,11 @@ export function SessionNodeItem({
+@@ -627,17 +668,18 @@ export function SessionNodeItem({
+       {/* Pending interaction and own or descendant activity outrank the
+           finished-but-unviewed reminder, which returns after activity stops
+           and is cleared by opening the session. Archived rows keep the slot
+-          blank — the grayed row carries the archived look — and their live
++          blank 闁?the grayed row carries the archived look 闁?and their live
+           status stays on the hover card only. */}
+       <span className={css.slot}>
+         {!row.archived && !row.blank && (showStatus
            ? <SessionStatusDots statuses={statuses} />
            : renderSlot('sidebar.session.row.leading', { sessionId: node.id }))}
        </span>
@@ -182,7 +345,16 @@ index 216a6fc..6b135a6 100644
            ? undefined
            : (e) => { e.stopPropagation(); onRenameRequest(node.id, row.title) }}
        >
-@@ -660,8 +700,10 @@ export function SessionNodeItem({
+@@ -646,7 +688,7 @@ export function SessionNodeItem({
+       {/* A blank New Session row is a provisional placeholder: nothing has
+           happened in it yet, so a "now" timestamp and the row verbs
+           (rename/fork/archive) would all act on content that does not
+-          exist — both trailing cells stay off until the first prompt. */}
++          exist 闁?both trailing cells stay off until the first prompt. */}
+       {!row.blank && (
+         <span
+           className={css.time}
+@@ -660,8 +702,10 @@ export function SessionNodeItem({
        {row.pinned && !row.archived && <PinnedIndicator t={t} />}
        {/* The strip's clicks stay in the strip: the trigger and every
            row.action entry act without also opening the row, so an entry's
@@ -195,26 +367,35 @@ index 216a6fc..6b135a6 100644
          <span className={css.rowActions} onClick={(e) => { e.stopPropagation() }}>
            <Menu
              open={menuOpen}
-@@ -688,6 +730,15 @@ export function SessionNodeItem({
+@@ -688,6 +732,15 @@ export function SessionNodeItem({
            {renderSlot('sidebar.workspaces.session.row.action', { sessionId: node.id, displayTitle: row.title })}
          </span>
        )}
-+      {/* An archived child row keeps the hover strip: restoring it is the only
-+          action that applies, and the archived-only view is where those rows
-+          become reachable again. The menu stays closed for child rows, so the
-+          rename, pin, and fork entries never target them. */}
-+      {!row.blank && row.childOf !== undefined && row.archived && (
++      {/* A child row renders the child-row action list and nothing else: the
++          menu stays closed, so rename, pin, and fork never target it, and the
++          ordinary row-action list is not rendered here, so an entry that acts on
++          an account position cannot reach a row the catalog places. */}
++      {!row.blank && row.childOf !== undefined && (
 +        <span className={css.rowActions} onClick={(e) => { e.stopPropagation() }}>
-+          {renderSlot('sidebar.workspaces.session.row.action', { sessionId: node.id, displayTitle: row.title })}
++          {renderSlot('sidebar.workspaces.session.childRow.action', { sessionId: node.id, displayTitle: row.title })}
 +        </span>
 +      )}
      </div>
    )
    return (
 diff --git a/packages/client/ui-workspace/src/client/rows/WorkspaceBrowser.tsx b/packages/client/ui-workspace/src/client/rows/WorkspaceBrowser.tsx
-index df87165..461721a 100644
+index df87165..7a842fe 100644
 --- a/packages/client/ui-workspace/src/client/rows/WorkspaceBrowser.tsx
 +++ b/packages/client/ui-workspace/src/client/rows/WorkspaceBrowser.tsx
+@@ -7,7 +7,7 @@
+  * rail entry path, each requesting expansion through the owner share. Adding
+  * is the header button's one action, so it raises the directory flow with no
+  * menu in between; the flow and its error dialog live in WorkspacePicker
+- * (same package — direct composition, no slot between them). A Session row's
++ * (same package 鈥?direct composition, no slot between them). A Session row's
+  * "..." menu and hover buttons are the `sidebar.workspaces.session.menu.item`
+  * and `sidebar.workspaces.session.row.action` lists rendered through this
+  * entry's `renderSlot`; the actions in them, this package's own included,
 @@ -33,8 +33,8 @@ import type { PropsRenderSlots } from '@deepseek-ai/dsh-client-ui-slots'
  import type { WorkspaceBrowserProps } from '../contract/slots.ts'
  import type { ArchivedFilter, GroupNode, SessionNode, SessionOrderBy, SessionRowState } from '../tree.ts'
@@ -226,6 +407,15 @@ index df87165..461721a 100644
  } from '../tree.ts'
  import { ProjectRowItem, SearchResultItem, SessionNodeItem } from './Rows.tsx'
  import { AnimatedRows } from './AnimatedRows.tsx'
+@@ -43,7 +43,7 @@ import { WorkspacePickFlow } from '../WorkspacePicker.tsx'
+ import css from './WorkspaceBrowser.module.css'
+ 
+ /**
+- * Column slide length (--ds-transition-duration-slow): rail-search focus waits it out —
++ * Column slide length (--ds-transition-duration-slow): rail-search focus waits it out 鈥?
+  * focus() forces a synchronous layout and would jank the slide.
+  */
+ const EXPAND_SLIDE_MS = 300
 @@ -56,37 +56,63 @@ const SESSION_WATERMARK_BASE = 5
  /** Highest watermark that attention-bearing Sessions raise automatically; Show more and search reveals may exceed it. */
  const SESSION_WATERMARK_AUTO_MAX = 50
@@ -307,6 +497,15 @@ index df87165..461721a 100644
    setGroupExpanded: (key: string, expanded: boolean) => void
    /** Save a drag order and select Manual. */
    setSessionOrder: (accountKey: string, order: readonly string[]) => void
+@@ -297,7 +323,7 @@ type SessionTreeProps = Pick<
+   onSessionRevealed: (sessionId: SessionId) => void
+ }
+ 
+-/** The list-empty placeholder — a glyph over the text; the archived-only view names its filter and offers the way back. */
++/** The list-empty placeholder 鈥?a glyph over the text; the archived-only view names its filter and offers the way back. */
+ function EmptySessions({ rowState, onLeaveArchivedOnly, t }: Pick<SessionTreeProps, 'rowState' | 'onLeaveArchivedOnly' | 't'>) {
+   const archivedOnly = rowState.archivedFilter === 'only'
+   return (
 @@ -376,8 +402,9 @@ function SessionTree({
      () => deriveGroups(list, workspaces, rowState, statuses, {
        expandedGroups,
@@ -369,7 +568,7 @@ index df87165..461721a 100644
 -/** The flat "In one list" body: every session is one draggable top-level row. */
 +/**
 + * The flat "In one list" body: every top-level session is one draggable row,
-+ * and a parent's subagent child rows follow it with drag wiring withheld — they
++ * and a parent's subagent child rows follow it with drag wiring withheld 鈥?they
 + * keep their parent's slot instead of an account position of their own.
 + */
  function FlatList({
@@ -461,6 +660,33 @@ index df87165..461721a 100644
                t={t}
              />
            )
+@@ -1082,7 +1130,7 @@ export function WorkspaceBrowser({
+   })
+   const searchRoot = useRef<HTMLDivElement | null>(null)
+   const searchInput = useRef<HTMLInputElement | null>(null)
+-  // Section-header ＋ opens the picker menu (same popover in wide and rail
++  // Section-header 锛?opens the picker menu (same popover in wide and rail
+   // states; the menu anchors on this button).
+   const wsPickerOpen = shortcutState.addRequested
+   const wsPlusRef = useRef<HTMLButtonElement>(null)
+@@ -1135,7 +1183,7 @@ export function WorkspaceBrowser({
+   // Outside-click dismissal stays off while the rail gesture is in flight
+   // (searchOnExpand): the rail click flips the shell wide and mounts this
+   // listener during its own dispatch, then keeps bubbling to document with
+-  // the now-unmounted rail button as its target — outside searchRoot, so the
++  // the now-unmounted rail button as its target 鈥?outside searchRoot, so the
+   // listener would dismiss the search that click just opened.
+   useEffect(() => {
+     if (!wide || !searchExpanded || searchOnExpand) return
+@@ -1360,7 +1408,7 @@ export function WorkspaceBrowser({
+             </Tooltip>
+           )}
+         </div>
+-        {/* Add flow + its error dialog (same package — direct composition). */}
++        {/* Add flow + its error dialog (same package 鈥?direct composition). */}
+         <WorkspacePickFlow
+           t={t}
+           open={wsPickerOpen}
 @@ -1432,6 +1480,8 @@ export function WorkspaceBrowser({
                  onSessionRenameRequest={requestSessionRename}
                  renderSlot={renderSlot}
@@ -827,10 +1053,10 @@ index eb67d0e..ed4b3c8 100644
  /**
 diff --git a/D:/ds_work/dsh-src/packages/client/ui-workspace/tests/child-rows.client.spec.tsx b/packages/client/ui-workspace/tests/child-rows.client.spec.tsx
 new file mode 100644
-index 0000000..c065d64
+index 0000000..8bc2215
 --- /dev/null
 +++ b/packages/client/ui-workspace/tests/child-rows.client.spec.tsx
-@@ -0,0 +1,602 @@
+@@ -0,0 +1,609 @@
 +// @vitest-environment jsdom
 +import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 +import type { Mock } from 'vitest'
@@ -893,7 +1119,8 @@ index 0000000..c065d64
 +  // seat takes.
 +  const renderSlot: RowRenderSlot = (name: string, owner: object) => {
 +    calls.push({ name, sessionId: (owner as { sessionId: SessionId }).sessionId })
-+    return name === 'sidebar.workspaces.session.row.action'
++    // Both row action lists stamp one entry so a press can be aimed at either.
++    return name === 'sidebar.workspaces.session.row.action' || name === 'sidebar.workspaces.session.childRow.action'
 +      ? <button type="button" data-testid="row-action-entry" />
 +      : null
 +  }
@@ -1245,10 +1472,11 @@ index 0000000..c065d64
 +  it('offers the archived child row its restore strip and nothing else', () => {
 +    const { calls } = mountShow()
 +    expect(screen.getByText('archived-child')).toBeTruthy()
-+    // Unarchive is the archived row's only applicable verb, and this strip is
-+    // the only row list an archived child row asks for: no menu list, and no
-+    // leading seat either, because an archived row keeps that cell blank.
-+    expect(forRow(calls, 'archived-child')).toEqual(['sidebar.workspaces.session.row.action'])
++    // Unarchive is the archived row's only applicable verb, and the child-row
++    // list is the only row list a child row asks for: no menu list, no ordinary
++    // row-action list (whose pin entry cannot apply), and no leading seat either,
++    // because an archived row keeps that cell blank.
++    expect(forRow(calls, 'archived-child')).toEqual(['sidebar.workspaces.session.childRow.action'])
 +  })
 +
 +  it('keeps the strip\'s press out of the archived child row', () => {
@@ -1262,6 +1490,11 @@ index 0000000..c065d64
 +    const { calls } = mountShow()
 +    expect(forRow(calls, 'live-child')).not.toContain('sidebar.workspaces.session.row.action')
 +    expect(forRow(calls, 'live-child')).not.toContain('sidebar.workspaces.session.menu.item')
++    // A live child row still carries the archive verb: the child-row list is
++    // offered on both child rows, and only there. A live row also asks for its
++    // leading seat, which is why the archived row's list is the exact one.
++    expect(forRow(calls, 'live-child')).toContain('sidebar.workspaces.session.childRow.action')
++    expect(forRow(calls, 'archived-child')).toEqual(['sidebar.workspaces.session.childRow.action'])
 +    // The parent row keeps the verbs the catalog owns; only it may ask for the
 +    // menu list, so closing or narrowing that block for child rows cannot
 +    // silently cost the parent its menu.
