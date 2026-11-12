@@ -14,6 +14,16 @@ A parent session, its children one indent step in, each parent carrying its own 
 
 Children are real sessions: click one to open its own conversation, and the parent keeps a one-line notice with that child's session id when it finishes — no extra `list_sessions` hop needed.
 
+### Detail: what a child session actually receives
+
+The task text arrives verbatim as the child's first user message — no wrapper prompt asking some other model turn to spawn it. This child was created from the sidebar; it confirms delivery in 14 seconds and reports back with `send_message`:
+
+![A child session receiving the parent's task text and confirming delivery](docs/screenshots/child-session-delivery.jpg)
+
+The second one shows the round trip the parent cares about: the child restates the task, states its working directory, and sends the result back to the parent's session id — all in one turn, with the tool call visible in the transcript:
+
+![A child session completing its assignment and reporting back to the parent](docs/screenshots/child-session-report.jpg)
+
 ## Features
 
 | # | Feature | How it works | Needs the optional patch? |
