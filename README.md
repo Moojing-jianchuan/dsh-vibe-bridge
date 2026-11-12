@@ -10,9 +10,7 @@ A plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 
 ## What it looks like
 
-A parent session, its children one indent step in, each parent carrying its own fold toggle. The panel entry on the left (`Vibe Bridge`) opens the scheduler page: a live session tree, a *Create child session* form, and the nudge rules currently in force.
-
-![Session list with child rows and the plugin's sidebar entry](docs/screenshots/sidebar-child-rows.png)
+A parent session, its children one indent step in, each parent carrying its own fold toggle (`▾` expanded / `▸` folded). The `Vibe Bridge` entry in the left rail opens the scheduler page: a live session tree, a *Create child session* form, and the nudge rules currently in force.
 
 Children are real sessions: click one to open its own conversation, and the parent keeps a one-line notice with that child's session id when it finishes — no extra `list_sessions` hop needed.
 
