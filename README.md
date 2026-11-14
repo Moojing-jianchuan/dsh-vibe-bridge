@@ -29,7 +29,7 @@ The second one shows the round trip the parent cares about: the child restates t
 | # | Feature | How it works | Needs the optional patch? |
 |---|---|---|---|
 | 1 | **Child sessions you can create directly** — right-click a session → *Create child session*, or `/vibe-spawn label\|task`, or the plugin's own panel | registers a host command (`ctx.commands.register`) and starts the activation; the child's first message is your task text, not a wrapper prompt | no |
-| 2 | **Parent gets the child id** — one notice per completed child, batched, carrying session id + status | `subagents.startActivation` with `delivery: "caller"`, then `agent.followup`; a debounce window merges children that finish together | no |
+| 2 | **Parent gets the child id** — one notice per **assigned** run, batched, carrying session id + status | `subagents.startActivation` with `delivery: "caller"`, then `agent.followup`; a debounce window merges children that finish together. A child run counts as assigned when this plugin started it or the parent messaged it (`post_to_session`); your own turns inside the child never notify the parent | no |
 | 3 | **`query_session`** — read another session's recent rounds from its persisted log | streams the JSONL session log, replays its multi-frame zstd, renders rounds + tool summary | no |
 | 4 | **`post_to_session` / `stop_session` / `list_sessions`** | thin, consistent wrappers over the subagent service with parent/child role checks | no |
 | 5 | **Turn-cadence prompt nudges** (碎碎念) | `agent/pre-step` injects a reminder at chosen turns; the text is re-read from disk each time; identical repeats collapse to a one-line marker | no |
@@ -37,6 +37,19 @@ The second one shows the round trip the parent cares about: the child restates t
 | 7 | **Nested, collapsible child rows in the *native* sidebar** | source patch against `ui-workspace` + your own build of that package | **yes** (experimental, version-bound) |
 
 Everything except #7 is a normal DSH plugin: install it, enable it in `cordis.patch.yml`, done. #7 rewrites one built client bundle, so it binds to a specific DSH build — see [Optional: child rows in the native sidebar](#optional-child-rows-in-the-native-sidebar).
+
+### Which runs notify the parent
+
+A child gives the parent a notice only when the parent asked for that run:
+
+| Who started the child's turn | Notice? |
+|---|---|
+| this plugin (`spawn_session`, the *Create child session* dialog, `/vibe-spawn`) | yes — once, when that activation settles |
+| the parent messaging it again (`post_to_session`) | yes — once per message: the plugin re-arms the child, so the first settle after the message reports back |
+| you, typing in the child's own conversation | **no** — the child is not armed, so the parent is left alone |
+| the child continuing work on its own after a notice | no |
+
+That is the `armed` flag in `wake-state.json`: it is set when the plugin spawns a child or the parent posts to it, cleared when the notice is queued, and it is what a restart compensates for. So opening a child and chatting with it does not spam its parent, while a task you actually assigned always comes back with its session id.
 
 ## Install the plugin
 
@@ -184,8 +197,8 @@ node tools/install-bundle.mjs --restore --dsh-node-modules "/path/to/dsh/node_mo
 ```
 lib/index.js                 host half: tools, nudges, wake notices, wake-state
 lib/client.js                client half: sidebar entry, panel tree, create-child dialog
-lib/nudge.md                 default nudge text (re-read per turn)
-test/                        host contract (25), client contract (16), wake-state probe (4)
+nudge.md                     default nudge text (re-read per turn)
+test/                        host contract (27), client contract (16), wake-state probe (4)
 tools/install.mjs            install into a profile (idempotent, runs the tests in place)
 tools/install-bundle.mjs     install/restore the optional sidebar bundle
 tools/dev-link.mjs           link @deepseek-ai/* from your DSH for local tests

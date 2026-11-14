@@ -381,6 +381,51 @@ const wakeCheck = async () => {
     assert.match(text, /乙/);
   });
   console.log(results.filter((line) => line.includes("批量合并")).join("\n"));
+
+  // 只有“父会话指派过的运行”才回报：你自己在子会话里聊天不会打扰父会话。
+  const manualStatuses = { "session-parent": "inactive", "child-session-0001": "running" };
+  const manualConfig = Config({
+    enabled: true,
+    provider: "spawn",
+    rules: [],
+    wakePollMs: 40,
+    wakeDebounceMs: 40,
+    wakeParentOnChildFinish: true,
+    persistWakeState: false,
+  });
+  const manualCtx = makeCtx(manualConfig, { agentsStatus: manualStatuses });
+  const parent = { id: "session-parent", session: { header: { origin: "parent" } } };
+  const continueDecision = async () => ({ kind: "continue", messages: [] });
+  // 两个轮次：第一轮看到子会话在跑，第二轮看到它停了 —— 但它从未被指派，所以不该回报。
+  await manualCtx.preStep[0]({ agent: parent, turn: 1, step: 1 }, continueDecision);
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  manualStatuses["child-session-0001"] = "inactive";
+  const manualTurn2 = await manualCtx.preStep[0]({ agent: parent, turn: 2, step: 1 }, continueDecision);
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  check("手动跟子会话对话不回报父会话", () => {
+    const injected = manualTurn2.messages.filter((message) => message.source?.kind === name);
+    const text = injected.map((message) => message.content.map((part) => part.text).join("")).join("");
+    assert.doesNotMatch(text, /child-session-0001/, "未指派的子会话不该出现在回报里");
+    assert.equal(manualCtx.woke.length, 0, "未指派的子会话完成不该唤醒父会话");
+  });
+  console.log(results.filter((line) => line.includes("手动跟子会话")).join("\n"));
+
+  // 父会话再投递一条任务（post_to_session）会重新 arm：这一轮干完才回报，且只回报一次。
+  manualStatuses["child-session-0001"] = "inactive";
+  await manualCtx.tools.get("post_to_session").execute(
+    { session_id: "child-session-0001", message: "接着干第二轮" },
+    { agent: parent },
+  );
+  manualStatuses["child-session-0001"] = "running";
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  manualStatuses["child-session-0001"] = "inactive";
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  check("post_to_session 重新授权一次回报", () => {
+    assert.equal(manualCtx.woke.length, 1, `应恰好收到 1 条回报，实际 ${manualCtx.woke.length}`);
+    const text = manualCtx.woke[0].message.content.map((part) => part.text).join("");
+    assert.match(text, /child-session-0001/);
+  });
+  console.log(results.filter((line) => line.includes("post_to_session 重新授权")).join("\n"));
 };
 
 run()

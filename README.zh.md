@@ -32,7 +32,7 @@
 | # | 功能 | 实现方式 | 需要可选补丁？ |
 |---|---|---|---|
 | 1 | **直接建子会话** —— 右键任一会话 →「创建子会话」，或用 `/vibe-spawn 名字\|任务`，或用插件面板 | 注册宿主命令（`ctx.commands.register`）后直接 `startActivation`；子会话收到的第一条消息就是任务原文，不是"请去创建子会话"的转述 | 否 |
-| 2 | **父会话拿到子会话 id** —— 每个子会话完成一条通知，带 id + 状态，同批合并 | `subagents.startActivation` 配 `delivery: "caller"`，再用 `agent.followup` 投递；合并窗口把同时收工的多个子会话压成一条 | 否 |
+| 2 | **父会话拿到子会话 id** —— 每次**被指派的运行**完成一条通知，带 id + 状态，同批合并 | `subagents.startActivation` 配 `delivery: "caller"`，再用 `agent.followup` 投递；合并窗口把同时收工的多个子会话压成一条。只有"本插件建出来的"或"父会话用 `post_to_session` 投过任务的"运行才算指派；你自己在子会话里聊的轮次不会回报父会话 | 否 |
 | 3 | **`query_session`** —— 读另一个会话最近几轮 | 流式读 JSONL 会话日志、按魔数切多帧 zstd、渲染轮次与工具摘要 | 否 |
 | 4 | **`post_to_session` / `stop_session` / `list_sessions`** | 对 subagent 服务的薄封装，带父子角色校验 | 否 |
 | 5 | **轮次碎碎念** | `agent/pre-step` 在指定轮次注入提醒；文案每轮从磁盘重读（改文件即时生效）；连续相同内容折叠成一行标记 | 否 |
@@ -40,6 +40,19 @@
 | 7 | **原生侧栏里的缩进子行 + 折叠** | 对 `ui-workspace` 的源码补丁 + 自建该包产物 | **是**（实验性，跟版本绑定）|
 
 除第 7 项外都是标准插件。原因很实在：DSH 在会话列表里只声明了 `menu.item` / `row.action` / `row.leading` / `row.hover` 四个插槽，**没有"插入一行"的插槽**，所以纯插件无论如何做不到原生子行 —— 这是接口事实，不是偷懒。
+
+### 哪些运行会回报父会话
+
+子会话只在"父会话要的那一轮"完成时回报：
+
+| 谁发起的这一轮 | 会不会回报 |
+|---|---|
+| 本插件（`spawn_session`、面板「创建子会话」、`/vibe-spawn`） | 会 —— 该 activation 收尾时回报一次 |
+| 父会话再给它投任务（`post_to_session`） | 会 —— 每条消息回报一次：投递时重新 arm，投完的第一次收尾就回报 |
+| **你自己**在子会话里打字聊天 | **不会** —— 子会话没被 arm，父会话不受打扰 |
+| 子会话回报之后自己继续干活 | 不会 |
+
+这就是 `wake-state.json` 里的 `armed` 标记：插件建子会话或父会话投递时置上，通知入队时清掉，重启补偿也只补"还 armed 且没回报过"的条目。所以打开子会话随便聊不会惊动它的父会话，而真正派下去的活一定会带着 session id 回来。
 
 ## 安装（插件部分）
 
@@ -183,8 +196,8 @@ node tools/install-bundle.mjs --restore --dsh-node-modules "/path/to/dsh/node_mo
 ```
 lib/index.js                 宿主半：工具、碎碎念、完成唤醒、唤醒状态落盘
 lib/client.js                客户端半：侧栏入口、面板会话树、创建子会话弹窗
-lib/nudge.md                 默认碎碎念文案（每轮重读）
-test/                        宿主契约 25 项、客户端契约 16 项、落盘探针 4 项
+nudge.md                     默认碎碎念文案（每轮重读）
+test/                        宿主契约 27 项、客户端契约 16 项、落盘探针 4 项
 tools/install.mjs            装进 profile（幂等，并在安装位置跑测试）
 tools/install-bundle.mjs     装/回滚可选的侧栏产物
 tools/dev-link.mjs           把 DSH 的 @deepseek-ai/* 联接到本包，便于本地跑测试
