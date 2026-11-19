@@ -31,12 +31,13 @@ The second one shows the round trip the parent cares about: the child restates t
 | 1 | **Child sessions you can create directly** — right-click a session → *Create child session*, or `/vibe-spawn label\|task`, or the plugin's own panel | registers a host command (`ctx.commands.register`) and starts the activation; the child's first message is your task text, not a wrapper prompt | no |
 | 2 | **Parent gets the child id** — one notice per **assigned** run, batched, carrying session id + status | `subagents.startActivation` with `delivery: "caller"`, then `agent.followup`; a debounce window merges children that finish together. A child run counts as assigned when this plugin started it or the parent messaged it (`post_to_session`); your own turns inside the child never notify the parent | no |
 | 3 | **`query_session`** — read another session's recent rounds from its persisted log | streams the JSONL session log, replays its multi-frame zstd, renders rounds + tool summary | no |
-| 4 | **`post_to_session` / `stop_session` / `list_sessions`** | thin, consistent wrappers over the subagent service with parent/child role checks | no |
-| 5 | **Turn-cadence prompt nudges** (碎碎念) | `agent/pre-step` injects a reminder at chosen turns; the text is re-read from disk each time; identical repeats collapse to a one-line marker | no |
-| 6 | **Wake state survives restarts** | `<DSH_HOME>/vibe-bridge/wake-state.json`, atomic writes, 12 h TTL, compensation on startup | no |
-| 7 | **Nested, collapsible child rows in the *native* sidebar** | source patch against `ui-workspace` + your own build of that package | **yes** (experimental, version-bound) |
+| 4 | **`post_to_session` / `stop_session` / `list_sessions`** | thin, consistent wrappers over the subagent service, with a pre-flight **communication matrix** (own child ✅ · parent↔parent ✅ · another parent's child ❌ · sibling ❌ · own parent ✅); `list_sessions(scope: 'workspace')` reads every persisted session with its `parent_id`/`workdir` | no |
+| 5 | **Delivery is visible and auditable** — `[inject]` blocks in `query_session`, three-state inbox replay (`queued`/`consumed`/`dropped`) and a `get_session_inbox` queue view | replays `agent/inbox/spliced` from the session log; no new event, no host change | no |
+| 6 | **Turn-cadence prompt nudges** (碎碎念) | `agent/pre-step` injects a reminder at chosen turns; the text is re-read from disk each time; identical repeats collapse to a one-line marker | no |
+| 7 | **Wake state survives restarts** | `<DSH_HOME>/vibe-bridge/wake-state.json`, atomic writes, 12 h TTL, compensation on startup | no |
+| 8 | **Nested, collapsible child rows in the *native* sidebar** | source patch against `ui-workspace` + your own build of that package | **yes** (experimental, version-bound) |
 
-Everything except #7 is a normal DSH plugin: install it, enable it in `cordis.patch.yml`, done. #7 rewrites one built client bundle, so it binds to a specific DSH build — see [Optional: child rows in the native sidebar](#optional-child-rows-in-the-native-sidebar).
+Everything except #8 is a normal DSH plugin: install it, enable it in `cordis.patch.yml`, done. #8 rewrites one built client bundle, so it binds to a specific DSH build — see [Optional: child rows in the native sidebar](#optional-child-rows-in-the-native-sidebar).
 
 ### Which runs notify the parent
 
@@ -102,19 +103,147 @@ The plugin reads its config from the profile's `cordis.patch.yml`:
 | `wakeDebounceMs` | 800 | batch window for completion notices |
 | `persistWakeState` | `true` | write `wake-state.json` and compensate on restart |
 | `enableSpawn` / `enableQuery` / `enablePost` / `enableList` / `enableStop` | `true` | per-tool switches |
+| `enableInbox` | `true` | register `get_session_inbox` |
+| `enableCrossParent` | `true` | allow `post_to_session({ cross_parent: true })` (the session-controller fallback) |
 
 ## Tools
 
 | Tool | Model-visible contract |
 |---|---|
 | `spawn_session(prompt, label?, cwd?)` | starts a child; returns `session started: <childSessionId>` |
-| `post_to_session(session_id, message, stop_current?)` | delivers a message to a session; prefixes `[来自会话 <id> 的消息]`; `stop_current` interrupts a running target first (direct children only) |
-| `list_sessions()` | all sessions with `{id, label, status, role: parent\|child}` |
-| `query_session(session_id, tail?, include_tools?, verbose?)` | header + the last `tail` rounds; `verbose` adds model/provider/workdir and longer excerpts |
+| `post_to_session(session_id, message, stop_current?, cross_parent?)` | delivers a message to a session, but only where the communication matrix allows it (own child / own parent / parent↔parent); prefixes `[来自会话 <id> 的消息]`; `stop_current` interrupts a running target first (direct children only); `cross_parent` is a parent↔parent switch only (top-level targets) and the result reports `via: 'subagent' \| 'controller'`; another parent's child or a sibling is refused before anything is sent |
+| `list_sessions(scope?)` | `scope: 'children'` (default) → `{id, label, status, role: parent\|child}`; `scope: 'workspace'` → every session in the session store with `{id, label, status, origin, parent_id?, workdir, workspace}` |
+| `query_session(session_id, tail?, include_tools?, verbose?)` | header + the last `tail` rounds, including an `[inject]` section for messages other sessions injected; `verbose` adds model/provider/workdir and longer excerpts |
+| `get_session_inbox(session_id)` | what is still queued in another session's inbox: `{position, target, source_kind, sender_session_id?, queued_at, preview}` |
 | `stop_session(session_id)` | interrupts a direct child only |
 | `vibe_bridge_status()` | live status, rule list, injected count **and injected characters** |
 
 The host command `/vibe-spawn <label>|<task>` backs the UI's *Create child session* action, so creating a child never costs a parent model turn.
+
+## Delivery visibility: injects, three states, cross-parent post, workspace scope
+
+DSH writes every inbox mutation to the session log as `agent/inbox/spliced`. That is the audit trail this plugin
+reads — no new event, no monkey-patching.
+
+### 1. `[inject]` in `query_session`
+
+`query_session` now renders a per-round `[inject]` block for every message that **another session or the runtime**
+injected, in arrival order, between `[user]` and `[assistant]`:
+
+```
+- Inbox: 1 pending, 2 consumed, 1 dropped
+
+--- [inject] 2026-11-12 07:28:11 · agent-message from session-30989533-… · consumed ---
+Agent session-30989533-… sent a message: 你的复核报告有用——B1 和 B2 都成立…
+    (consumed at 2026-11-12 07:28:44 — drained into the next request)
+```
+
+- The line shape is `--- [inject] <time> · <source.kind>[ from <senderSessionId>] · <status> ---`.
+- Body is clipped at 160 chars by default, 1200 with `verbose: true` (`…[+N chars]` tells you what was dropped).
+- Deduplication is **by message id**, not by source kind: anything whose id is *not* already rendered by the
+  `[user]` block is listed here. That matters because a message reaches a request through two different paths:
+  a **running** session writes both `agent/inbox/spliced` and a `user/message` event (the `[user]` block shows it,
+  so `[inject]` skips it), while a **cold/resumed** session can be fed straight from a splice with *no* `user/message`
+  event at all — filtering those out by source kind used to make the message completely invisible, which is exactly
+  the "I sent it and cannot see it" failure the feature exists to kill.
+- `tail`, `include_tools` and `verbose` keep their old meaning; the header summary counts the entries listed in
+  `[inject]`, so it can include `user`-sourced rows (the cold-session case).
+- Deduplication deliberately looks only at `user/message` events the `[user]` block would render
+  (`source.kind` missing or `'user'`). `agent-message`, `agent-instructions` and `vibe-bridge` messages are *also*
+  written as `user/message` events, but `[user]` does not render them — deduplicating against "the event exists"
+  would delete them from the report instead of showing them twice.
+
+### 2. Three delivery states + `get_session_inbox`
+
+Replaying the splices gives every injected message one of three states:
+
+| State | How the log says it | Meaning |
+|---|---|---|
+| `queued` | inserted, never removed | still waiting; nobody consumed it |
+| `consumed` | removed with `removedCount > 0`, no `outcome` | claimed by the next request (`Inbox.claim()`) |
+| `dropped` | removed with `outcome: 'canceled'` | canceled/`clear()`ed/interrupted before consumption |
+
+`get_session_inbox(session_id)` lists only what is still `queued`, with its queue position, `next-turn`/`next-step`
+target, source kind, sender session id (when the source records one) and queue time — plus a `note` that says so
+explicitly when the target is idle or not loaded. A pending entry is never reported as consumed: an interrupted
+target keeps showing `queued` until the log itself records the removal.
+
+**`pending: 0` is the normal, healthy answer.** A running (or freshly resumed) session claims its queue at the start
+of the next step, so a delivered message is usually `consumed` within seconds — query `query_session` and read the
+`- Inbox:` line plus the `[inject]` block, which keep the durable record. Only a session that never starts again
+keeps an entry parked in `queued` (verified on a real offline session: one message stuck at `queued` since
+2026-11-11). So `pending: 0` never means "the delivery did not happen"; it means "nothing is waiting right now".
+
+Queue reality check: the header counts the entries listed in `[inject]`, while `get_session_inbox` shows the raw
+queue, so a queued human prompt can appear in both, in one, or (for a message the target already claimed) in neither.
+
+### 3. Who may message whom (and how `post_to_session` decides)
+
+`post_to_session` no longer "tries and fails". It **reads both session headers first** (the same lightweight
+first-`session`-event read as the workspace listing), decides against the communication matrix, and only then delivers.
+A refused row never reaches `subagents.sendMessage`, never touches the session controller, and produces no side effect:
+
+| Sender | Receiver | Result | Guaranteed by |
+|---|---|---|---|
+| parent | **its own** child | ✅ delivered, `via: 'subagent'` — durable `agent-message` attribution (`source.kind`, `senderSessionId`) | plugin pre-flight + DSH lineage (both agree) |
+| parent | another **top-level** session (parent↔parent) | ✅ delivered, `via: 'controller'` — attribution degrades to the `[来自会话 <id> 的消息]` body prefix | plugin pre-flight + `sessionController.prompt` (no lineage check) |
+| parent | **another parent's** child | ❌ refused up front: `post_to_session: 目标是别的父会话的子会话（<id>，属 <parentId>）…` | plugin pre-flight; DSH `authorizeLineage` would refuse it too |
+| child | a **sibling** child | ❌ refused up front (same message: subagents, siblings included, may not message each other) | plugin pre-flight; DSH lineage would refuse it too |
+| child | **its own** parent | ✅ delivered — the return channel, `via: 'subagent'` (controller only if the message path is lineage-rejected) | plugin pre-flight + DSH lineage |
+
+```jsonc
+// own child / own parent — durable attribution preserved
+{ "messageId": "…", "via": "subagent" }
+// parent↔parent (top-level target) — delivered, attribution degraded to the body prefix
+{ "messageId": "controller-…", "via": "controller" }
+```
+
+How the decision is made:
+
+- target `origin !== 'subagent'` → top-level: parent↔parent uses the controller; a **child** sender may only reach a
+  top-level session when that session is its own parent (anything else is refused);
+- target `origin === 'subagent'` and `parentSession === caller` → the subagent message path (unchanged);
+- target `origin === 'subagent'` and `parentSession !== caller` → refused before delivery (includes siblings);
+- target log unreadable (not flushed yet) → the decision cannot be made, so the pre-0.10 behaviour is kept: try
+  `sendMessage`, and only on a lineage rejection with `cross_parent: true` retry the controller.
+
+`cross_parent` keeps its name but is now a **parent↔parent switch only**: it never unlocks a subagent target.
+Omitting it allows parent↔parent; passing `cross_parent: false` means "do not leave my own lineage", so a top-level
+target is then refused with a message telling you to drop the flag.
+
+The controller hard-codes `source.kind = 'user'`, so a parent↔parent message is attributed by its
+`[来自会话 <senderId> 的消息]` prefix. On a **cold** target it shows up only in `[inject]` (there is no
+`user/message` event); on a target that writes one, it shows up in `[user]`. Either way it is visible.
+`via` is the honest signal: `controller` means the sender id in the log is not trustworthy, only the prefix is.
+`stop_current` semantics are unchanged.
+
+**Why parent→another-parent's-child can never work (even without the pre-flight):** that path needs the session
+controller, and the controller refuses to resolve a subagent-origin session at all —
+
+- `packages/api/session-controller/src/agent.ts:115` — `hasApiSessionSubagentOwner` returns `true` for
+  `session.header.origin === 'subagent'`, so `resolve()` raises `session/agent-busy` and `commands.prompt` dies inside
+  `resolveAgent` before it ever reaches `followup()`.
+
+This is a DSH core design decision (a subagent session has no "API owner"), not something a plugin can bypass — the
+plugin surface offers no other write path into another session's inbox. Enabling it needs an upstream change: either
+relax `authorizeLineage` (`packages/subagent/subagent/src/manager.ts:713-722`) so a non-ancestor sender can be
+explicitly authorized, or let the controller resolve `origin: 'subagent'` sessions for an attested caller.
+
+### 4. `list_sessions(scope: 'workspace')`
+
+`scope: 'workspace'` scans `<DSH_HOME>/sessions/*/*` and reads each log's **first event** (`type: 'session'`), which
+is where `parentSession`, `cwd`, `origin` and `delegationDepth` actually live — `request/header` does not carry them.
+Only the first 256 KB of each log is read and decoded, so a full listing of ~80 sessions takes well under a second.
+
+```
+d2a74178-… [running] (child of session-30989533-…) — 实现 R1-R4 会话通信改造  ·  D:\ds_work  ·  --D-ds_work--
+a1f82c62-… [inactive] (top-level) — 重建工作区  ·  D:\ds_work  ·  --D-ds_work--
+```
+
+`status` is `running` / `inactive` when the Agent is still registered in `ctx.agents`, and `not-loaded` otherwise
+(after a restart, or for sessions of another process) — that is a fact about the registry, not about the session.
+Rows from your own workspace come first, then newest first. This is also how you discover an id to use with
+`post_to_session({ cross_parent: true })`.
 
 ## What it costs in context
 
@@ -180,7 +309,9 @@ Upgrading DSH: re-run `tools/install.mjs` (plugin half is version-agnostic until
 ## Limitations
 
 - **No row slot** — that is the whole reason for the source patch. Any claim that native nested rows can be done by a plugin alone is wrong.
+- **Messaging is not a free-for-all** — own child ✅, own parent ✅, parent↔parent ✅; another parent's child and siblings are refused before any delivery is attempted, and no plugin-level switch can change that (the controller will not resolve a subagent-origin session; see section 3).
 - **`query_session` reads logs, not memory** — it needs a persisted session log; an unflushed running turn shows whatever the log already holds.
+- **A message that was refused is not a message that was lost** — a refused `post_to_session` throws with a reason and leaves no trace in the target log, which is exactly why it is refused up front instead of failing halfway.
 - **Wake compensation infers termination** — after a restart the plugin sees "the child is no longer running", not its real stop reason; a child killed while DSH was down is reported as finished.
 - **Child rows only list `continuable` children** — `external` (one-shot ACP) children have no resumable session to open.
 - **`test:gui` in a DSH checkout** is red on Windows for reasons unrelated to this plugin (`ui-deliverables` needs symlink privileges; two other specs are flaky under parallel load). See [docs/troubleshooting.md](docs/troubleshooting.md).

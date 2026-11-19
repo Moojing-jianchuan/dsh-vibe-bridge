@@ -7,7 +7,22 @@
  * 运行：node test/smoke.mjs
  */
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
+import { zstdCompressSync } from "node:zlib";
 import { apply, Config, name } from "../lib/index.js";
+import { assertSupportedJsonSchema, validateJsonSchemaValue } from "@deepseek-ai/dsh-tools";
+
+/**
+ * 会话日志用例使用临时 DSH_HOME：绝不碰真实的 ~/.dsh 会话库。
+ * （lib/index.js 里的 dshHome() 每次现读 env，所以在这里设也来得及。）
+ */
+const TEST_HOME = mkdtempSync(path.join(tmpdir(), "vb-smoke-"));
+process.env.DSH_HOME = TEST_HOME;
+process.on("exit", () => {
+  rmSync(TEST_HOME, { recursive: true, force: true });
+});
 
 const results = [];
 function check(title, fn) {
@@ -21,7 +36,10 @@ function check(title, fn) {
 }
 
 /** 造一个最小可用的假 Cordis 上下文。 */
-function makeCtx(config, { agentsStatus = "running", children = [] } = {}) {
+function makeCtx(
+  config,
+  { agentsStatus = "running", children = [], postFailure = {}, sessionController = undefined } = {},
+) {
   const preStep = [];
   const tools = new Map();
   const activations = [];
@@ -52,6 +70,9 @@ function makeCtx(config, { agentsStatus = "running", children = [] } = {}) {
         return { childId, result: Promise.resolve({}) };
       },
       async sendMessage(sender, target, content, options) {
+        // 模拟 subagent 的血缘拒收（跨父投递用例）
+        const failure = postFailure[target];
+        if (failure !== undefined) throw new Error(failure);
         messages.push({ sender, target, content, options });
         return "inbox-message-0001";
       },
@@ -76,6 +97,10 @@ function makeCtx(config, { agentsStatus = "running", children = [] } = {}) {
         return { status: agentsStatus, followup: (message) => woke.push({ id, message }) };
       },
     },
+    // 只有配了假 sessionController 时才提供 ctx.get（其余用例保持“服务缺失”的老行为）
+    ...(sessionController === undefined
+      ? {}
+      : { get: (service) => (service === "sessionController" ? sessionController : undefined) }),
     commands: {
       register(definition) {
         commands.push(definition);
@@ -120,9 +145,10 @@ check("Config 归一化：默认值补齐", () => {
 
 const { preStep, tools, activations, messages, interrupted, commands } = makeCtx(config);
 
-check("注册了 1 个中间件 + 6 个工具", () => {
+check("注册了 1 个中间件 + 7 个工具", () => {
   assert.equal(preStep.length, 1);
   assert.deepEqual([...tools.keys()].sort(), [
+    "get_session_inbox",
     "list_sessions",
     "post_to_session",
     "query_session",
@@ -428,8 +454,573 @@ const wakeCheck = async () => {
   console.log(results.filter((line) => line.includes("post_to_session 重新授权")).join("\n"));
 };
 
+// ---------------------------------------------------------------------------
+// R1 / R2 / R3 / R4：注入可见性、投递三态、跨父投递、workspace 列表
+// ---------------------------------------------------------------------------
+
+/** 异步版 check：新用例基本都要 await 工具调用。 */
+async function checkAsync(title, fn) {
+  try {
+    await fn();
+    results.push(`PASS  ${title}`);
+  } catch (error) {
+    results.push(`FAIL  ${title}\n      ${error?.message ?? error}`);
+    process.exitCode = 1;
+  }
+}
+
+/**
+ * 按真实 harness 的口径校验工具输出：`output.schema` 必须是受支持子集，
+ * 返回值必须通过校验，且不能带 `undefined` 值的键（快照会把它当成非法 JSON）。
+ */
+function assertOutputContract(toolMap, toolName, value) {
+  const definition = toolMap.get(toolName);
+  assert.ok(definition !== undefined, `${toolName} 应已注册`);
+  const walk = (node, where) => {
+    if (node === null || typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      node.forEach((entry, index) => walk(entry, `${where}[${index}]`));
+      return;
+    }
+    for (const [key, entry] of Object.entries(node)) {
+      assert.notEqual(entry, undefined, `${where}.${key} 不该是 undefined（快照不接受）`);
+      walk(entry, `${where}.${key}`);
+    }
+  };
+  walk(value, toolName);
+  // defineTool 已经把 author DSL 编成 raw JSON Schema 存进 output.schema，
+  // 这里直接按 harness 的方式校验（register 时 assertSupported、execute 后 validate）。
+  const schema = definition.output.schema;
+  assertSupportedJsonSchema(schema);
+  const violations = validateJsonSchemaValue(schema, JSON.parse(JSON.stringify(value)), "value");
+  assert.deepEqual(violations, [], `${toolName} 输出不符合 output.schema：${violations.join("; ")}`);
+}
+
+const SESSIONS_ROOT = path.join(TEST_HOME, "sessions");
+const WS_SLUG = "--D-fake-workspace--";
+const INBOX_SESSION = "child-inbox-0001";
+const PARENT_SESSION = "session-parent";
+const T0 = 1793713794745;
+
+/**
+ * 写一个假的会话日志：多帧 zstd + JSONL（和真实 `session.v4.jsonl.zstd` 同形）。
+ * 故意切成两帧：解码必须能把多帧拼起来。
+ */
+const fixtureIds = [];
+function writeSessionFixture(sessionId, events, slug = WS_SLUG) {
+  const dir = path.join(SESSIONS_ROOT, slug, sessionId);
+  mkdirSync(dir, { recursive: true });
+  const text = `${events.map((event) => JSON.stringify(event)).join("\n")}\n`;
+  const half = Math.floor(text.length / 2);
+  const frames = [
+    zstdCompressSync(Buffer.from(text.slice(0, half), "utf8")),
+    zstdCompressSync(Buffer.from(text.slice(half), "utf8")),
+  ];
+  writeFileSync(path.join(dir, "session.v4.jsonl.zstd"), Buffer.concat(frames));
+  if (!fixtureIds.includes(sessionId)) fixtureIds.push(sessionId);
+  return dir;
+}
+
+/** 只有元数据（首条 session 事件）的夹具：权限判定只读这一条。 */
+function metaOnlyEvents({ id, parentSession, origin, createdAt, cwd = "D:/fake-workspace", depth = 0 }) {
+  const session = { type: "session", version: 4, id, createdAt, cwd, delegationDepth: depth };
+  if (parentSession !== undefined) session.parentSession = parentSession;
+  if (origin !== undefined) session.origin = origin;
+  return [session, { type: "turn/start", seq: 1, time: createdAt + 1, data: { turn: 1 } }];
+}
+
+/**
+ * 通信权限矩阵夹具：真实会话 id + 真实父子关系（对应线上的 81cf4265 / dacd984b / 30989533 / 15d41732 / 680bacb8）。
+ * 判定只读日志首条 `session` 事件里的 `origin` / `parentSession`，所以这些夹具足够代表线上形状。
+ */
+const TOP_A = "session-81cf4265-9e95-480b-8878-0653eabf3f8e"; // 顶层父会话
+const CHILD_A = "dacd984b-2ea9-418d-b3af-2bbdcfacb60a"; // TOP_A 的子会话
+const SIBLING_A = "680bacb8-5868-4a68-8a1d-e3dcf1aed1e6"; // TOP_A 的另一个子会话（兄弟）
+const TOP_B = "session-30989533-b404-44fa-97ca-eaa9a173060a"; // 另一个顶层父会话
+const CHILD_B = "15d41732-b6c3-4f70-8209-a36a4226bfb6"; // TOP_B 的子会话
+const MATRIX_FIXTURES = [
+  { id: TOP_A, createdAt: T0 - 5000 },
+  { id: CHILD_A, parentSession: TOP_A, origin: "subagent", createdAt: T0 - 4000, depth: 1 },
+  { id: SIBLING_A, parentSession: TOP_A, origin: "subagent", createdAt: T0 - 3000, depth: 1 },
+  { id: TOP_B, createdAt: T0 - 2000 },
+  { id: CHILD_B, parentSession: TOP_B, origin: "subagent", createdAt: T0 - 1000, depth: 1 },
+];
+
+/** 一条消息（DSH 的 UserMessage 形状）。 */
+function inboxMessage(id, text, source) {
+  return { id, content: [{ type: "text", text }], source };
+}
+
+const SOURCE_AGENT = { kind: "agent-message", form: "relay", senderSessionId: PARENT_SESSION };
+const SOURCE_USER = { kind: "user" };
+const SOURCE_BRIDGE = { kind: "vibe-bridge", form: "notice" };
+/** 1094 字符：默认 160 截断，verbose 1200 保持完整。 */
+const LONG_TEXT = `D:长正文 ${"x".repeat(1080)} END-D`;
+
+/**
+ * 夹具：三条注入分别走「插入未移除 / 移除 / 移除+canceled」，外加两种 user 来源形态：
+ *   - `msg-user`：**只有 splice、没有 user/message**（冷会话 resume 的真实日志形状，R1 的缺口）；
+ *   - `msg-both`：splice 与 user/message 都有（运行中的会话，[user] 段已经渲染）。
+ * 终态：pending 2（U、A）、consumed 2（B、D）、dropped 1（C）；`msg-both` 被消费且不进 [inject]。
+ */
+function inboxFixtureEvents() {
+  return [
+    {
+      type: "session",
+      version: 4,
+      id: INBOX_SESSION,
+      createdAt: T0,
+      cwd: "D:/fake-workspace",
+      parentSession: PARENT_SESSION,
+      origin: "subagent",
+      delegationDepth: 1,
+    },
+    { type: "session/title", seq: 0, time: T0 + 1, data: { title: "假日志：注入可见性" } },
+    { type: "turn/start", seq: 1, time: T0 + 2, data: { turn: 1 } },
+    {
+      type: "agent/inbox/spliced",
+      seq: 2,
+      time: T0 + 10,
+      data: { target: "next-turn", start: 0, inserted: [inboxMessage("msg-user", "U: 冷会话注入，只有 splice 没有 user/message。", SOURCE_USER)] },
+    },
+    {
+      type: "agent/inbox/spliced",
+      seq: 3,
+      time: T0 + 20,
+      data: { target: "next-turn", start: 1, inserted: [inboxMessage("msg-a", "A: 关键路径纠正：工具在 tools/ 子目录，不在包根。", SOURCE_AGENT)] },
+    },
+    {
+      type: "agent/inbox/spliced",
+      seq: 4,
+      time: T0 + 30,
+      data: { target: "next-turn", start: 2, inserted: [inboxMessage("msg-b", "B: 基线确认：先跑 smoke 再改。", SOURCE_AGENT)] },
+    },
+    { type: "agent/inbox/spliced", seq: 5, time: T0 + 40, data: { target: "next-turn", start: 2, removedCount: 1, inserted: [] } },
+    {
+      type: "agent/inbox/spliced",
+      seq: 6,
+      time: T0 + 50,
+      data: { target: "next-turn", start: 2, inserted: [inboxMessage("msg-c", "C: 这条被中断丢弃。", SOURCE_BRIDGE)] },
+    },
+    {
+      type: "agent/inbox/spliced",
+      seq: 7,
+      time: T0 + 60,
+      data: { target: "next-turn", start: 2, removedCount: 1, inserted: [], outcome: "canceled" },
+    },
+    {
+      type: "agent/inbox/spliced",
+      seq: 8,
+      time: T0 + 70,
+      data: { target: "next-turn", start: 2, inserted: [inboxMessage("msg-d", LONG_TEXT, SOURCE_AGENT)] },
+    },
+    { type: "agent/inbox/spliced", seq: 9, time: T0 + 80, data: { target: "next-turn", start: 2, removedCount: 1, inserted: [] } },
+    // 「两边都有」：先 splice 入队，再被消费；同一 id 另有一条 user/message（运行中会话的真实形状）
+    {
+      type: "agent/inbox/spliced",
+      seq: 10,
+      time: T0 + 85,
+      data: { target: "next-turn", start: 2, inserted: [inboxMessage("msg-both", "BOTH-VISIBLE: 这条 splice 与 user/message 都有。", SOURCE_USER)] },
+    },
+    { type: "agent/inbox/spliced", seq: 11, time: T0 + 86, data: { target: "next-turn", start: 2, removedCount: 1, inserted: [] } },
+    {
+      type: "user/message",
+      seq: 12,
+      time: T0 + 87,
+      data: { id: "msg-both", role: "user", source: SOURCE_USER, content: [{ type: "text", text: "BOTH-VISIBLE: 这条 splice 与 user/message 都有。" }] },
+    },
+    // 反例守卫：agent-message 也会被写成 user/message，但它必须仍然留在 [inject] 段
+    {
+      type: "user/message",
+      seq: 13,
+      time: T0 + 88,
+      data: { id: "msg-a", role: "user", source: SOURCE_AGENT, content: [{ type: "text", text: "A: 关键路径纠正：工具在 tools/ 子目录，不在包根。" }] },
+    },
+    {
+      type: "assistant/message",
+      seq: 14,
+      time: T0 + 90,
+      data: { message: { content: [{ type: "text", text: "子会话的回答。" }] } },
+    },
+  ];
+}
+
+const deliveryCheck = async () => {
+  const firstNew = results.length;
+  // ---- 夹具：一个子会话（有注入）+ 它自己的父会话（workspace 列表用）----
+  writeSessionFixture(INBOX_SESSION, inboxFixtureEvents());
+  writeSessionFixture(PARENT_SESSION, [
+    { type: "session", version: 4, id: PARENT_SESSION, createdAt: T0 - 1000, cwd: "D:/fake-workspace", delegationDepth: 0 },
+    { type: "turn/start", seq: 1, time: T0 - 900, data: { turn: 1 } },
+  ]);
+  // ---- 通信矩阵夹具：真实会话 id + 真实父子关系（只读日志首条 session 事件即可判定）----
+  for (const fixture of MATRIX_FIXTURES) writeSessionFixture(fixture.id, metaOnlyEvents(fixture));
+
+  const inboxConfig = Config({ enabled: true, provider: "spawn", rules: [], persistWakeState: false });
+  // agentsStatus 用字符串：任何 id 都报 inactive，用来验证「idle 时不谎报 consumed」。
+  const inboxCtx = makeCtx(inboxConfig, { agentsStatus: "inactive" });
+
+  // ---- R1：[inject] 段 ----
+  const report = (
+    await inboxCtx.tools.get("query_session").execute({ session_id: INBOX_SESSION, tail: 1 }, { agent: { id: PARENT_SESSION } })
+  ).report;
+  const verboseReport = (
+    await inboxCtx.tools.get("query_session").execute(
+      { session_id: INBOX_SESSION, tail: 1, verbose: true },
+      { agent: { id: PARENT_SESSION } },
+    )
+  ).report;
+
+  await checkAsync("R1 注入进会话记录：[inject] 段带时间/来源/状态，[user] 已渲染的不重复", () => {
+    assert.match(report, /--- \[inject\] \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} · agent-message from session-parent · queued ---/);
+    assert.match(report, /A: 关键路径纠正/);
+    assert.match(report, /--- \[inject\] .* · agent-message from session-parent · consumed ---/);
+    assert.match(report, /--- \[inject\] .* · vibe-bridge · dropped ---/);
+    // user 来源的注入现在照样进 [inject]（冷会话路径），标注就是 user
+    assert.match(report, /--- \[inject\] .* · user · queued ---/);
+    assert.ok(report.includes("U: 冷会话注入"), "只有 splice 的 user 注入必须可见");
+    // 既有段位不退化
+    assert.match(report, /--- \[user\] Round 1 ---/);
+    assert.match(report, /--- \[assistant\] Round 1 ---/);
+    assert.match(report, /- Title: 假日志：注入可见性/);
+    assert.match(report, /- Parent: session-parent/);
+  });
+
+  await checkAsync("R1 缺口修复：冷会话（只有 splice、没有 user/message）的注入不再消失", () => {
+    // 真实形状：agent/inbox/spliced → turn/start → 再被消费，全程没有 user/message
+    const coldSession = "session-cold-0001";
+    writeSessionFixture(coldSession, [
+      { type: "session", version: 4, id: coldSession, createdAt: T0, cwd: "D:/fake-workspace", delegationDepth: 0 },
+      {
+        type: "agent/inbox/spliced",
+        seq: 1,
+        time: T0 + 100,
+        data: {
+          target: "next-turn",
+          start: 0,
+          inserted: [inboxMessage("cold-1", "COLD: [来自会话 session-30989533 的消息] 别动同一个仓库", SOURCE_USER)],
+        },
+      },
+      { type: "turn/start", seq: 2, time: T0 + 110, data: { turn: 61 } },
+      { type: "agent/inbox/spliced", seq: 3, time: T0 + 120, data: { target: "next-turn", start: 0, removedCount: 1, inserted: [] } },
+      { type: "turn/end", seq: 4, time: T0 + 130, data: { turn: 61 } },
+    ]);
+    return (async () => {
+      const coldReport = (
+        await inboxCtx.tools.get("query_session").execute({ session_id: coldSession, tail: 1 }, { agent: { id: PARENT_SESSION } })
+      ).report;
+      assert.match(coldReport, /--- \[user\] Round 61 ---\n\(no user message\)/, "冷会话没有 user/message，[user] 段应为空");
+      assert.match(coldReport, /--- \[inject\] .* · user · consumed ---/, "被消费的冷会话注入必须带状态出现");
+      assert.ok(coldReport.includes("别动同一个仓库"), "注入正文必须可见");
+      assert.match(coldReport, /- Inbox: 0 pending, 1 consumed, 0 dropped/);
+    })();
+  });
+
+  await checkAsync("R1 去重：splice 与 user/message 都有时只在 [user] 出现一次", () => {
+    assert.equal(report.split("BOTH-VISIBLE").length - 1, 1, "[user] 段里应恰好出现一次");
+    assert.doesNotMatch(report, /\[inject\][^\n]*\nBOTH-VISIBLE/, "同一 id 不该再进 [inject] 段");
+    // [user] 段确实渲染了它（对照：冷会话那条没有 user/message 才走 [inject]）
+    const userSection = report.split("--- [inject] ")[0];
+    assert.match(userSection, /BOTH-VISIBLE/, "[user] 段应包含它");
+  });
+
+  await checkAsync("R1 去重口径：agent-message 也被写成 user/message 时仍留在 [inject]", () => {
+    // 夹具里 msg-a 同时有 user/message（source.kind='agent-message'），[user] 段不渲染它，
+    // 所以它必须留在 [inject] —— 按「事件存在」去重会把它抹掉。
+    assert.match(report, /--- \[inject\] .* · agent-message from session-parent · queued ---/);
+    assert.match(report, /A: 关键路径纠正/);
+  });
+
+  await checkAsync("R1 汇总行 + 三态原因（consumed/dropped 各自说明）", () => {
+    // 汇总 = [inject] 段里的条目：2 条仍在队列、2 条已被消费、1 条被丢弃。
+    assert.match(report, /- Inbox: 2 pending, 2 consumed, 1 dropped/);
+    assert.match(report, /\(consumed at \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} — drained into the next request\)/);
+    assert.match(report, /\(dropped at \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} — removed or canceled before consuming\)/);
+  });
+
+  await checkAsync("R1 正文截断：默认 160 字，verbose 1200 字", () => {
+    assert.ok(!report.includes("END-D"), "默认应截断长正文");
+    assert.match(report, /…\[\+\d+ chars\]/);
+    assert.ok(verboseReport.includes("END-D"), "verbose 应保留 1094 字正文");
+  });
+
+  // ---- R2：三态 + get_session_inbox ----
+  const inbox = await inboxCtx.tools.get("get_session_inbox").execute({ session_id: INBOX_SESSION }, { agent: { id: PARENT_SESSION } });
+
+  await checkAsync("R2 三态：get_session_inbox 只列 queued，三态在报告里可分辨", () => {
+    const reportStatuses = report
+      .split("\n")
+      .filter((line) => line.startsWith("--- [inject] "))
+      .map((line) => line.replace(/.*· /, "").replace(/ ---$/, ""));
+    assert.deepEqual(reportStatuses, ["queued", "queued", "consumed", "dropped", "consumed"], "三态应为 queued(U)/queued(A)/consumed(B)/dropped(C)/consumed(D)");
+  });
+
+  await checkAsync("R2 get_session_inbox 结构（position/target/source_kind/sender/queued_at/preview）", () => {
+    assert.equal(inbox.session_id, INBOX_SESSION);
+    assert.equal(inbox.pending_count, 2);
+    assert.deepEqual(inbox.pending.map((entry) => entry.position), [1, 2]);
+    assert.deepEqual(inbox.pending.map((entry) => entry.target), ["next-turn", "next-turn"]);
+    assert.equal(inbox.pending[0].source_kind, "user");
+    assert.equal(inbox.pending[1].source_kind, "agent-message");
+    assert.equal(inbox.pending[1].sender_session_id, "session-parent");
+    assert.match(inbox.pending[1].queued_at, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+    assert.match(inbox.pending[1].preview, /A: 关键路径纠正/);
+    // 只有 queued：B（consumed）/C（dropped）不在列表里
+    const all = JSON.stringify(inbox.pending);
+    assert.ok(!all.includes("B: 基线确认"), "consumed 的注入不该出现在 inbox");
+    assert.ok(!all.includes("C: 这条被中断丢弃"), "dropped 的注入不该出现在 inbox");
+    assert.ok(!all.includes("END-D"), "consumed 的长正文不该出现在 inbox");
+  });
+
+  await checkAsync("R2 目标空闲时仍报 queued 并给出说明（不谎报 consumed）", () => {
+    assert.equal(inbox.session_status, "inactive");
+    assert.match(inbox.note, /still queued/);
+    const rendered = inboxCtx.tools.get("get_session_inbox").output.render({ session_id: INBOX_SESSION }, inbox);
+    const text = rendered.map((part) => part.text).join("");
+    assert.match(text, /## get_session_inbox/);
+    assert.match(text, /agent-message from session-parent/);
+  });
+
+  await checkAsync("R2 get_session_inbox 对未知会话报错", async () => {
+    await assert.rejects(
+      inboxCtx.tools.get("get_session_inbox").execute({ session_id: "no-such-session-9999" }, {}),
+      /no persisted log/,
+    );
+  });
+
+  // ---- R4：list_sessions(scope: 'workspace') ----
+  // 父会话的 status 有值、子会话不在内存里 → not-loaded
+  const workspaceCtx = makeCtx(inboxConfig, { agentsStatus: { [PARENT_SESSION]: "inactive" } });
+  const workspaceRows = await workspaceCtx.tools
+    .get("list_sessions")
+    .execute({ scope: "workspace" }, { agent: { id: PARENT_SESSION } });
+
+  await checkAsync("R4 workspace 列表带 parent_id / workdir / origin / status", () => {
+    // 列出的会话集合必须与写入的夹具集合完全一致（不靠魔数维持）
+    assert.deepEqual(
+      workspaceRows.map((row) => row.id).sort(),
+      [...fixtureIds].sort(),
+      `应列出全部夹具会话，实际 ${JSON.stringify(workspaceRows.map((row) => row.id))}`,
+    );
+    const child = workspaceRows.find((row) => row.id === INBOX_SESSION);
+    assert.ok(child !== undefined, "应列出子会话");
+    assert.equal(child.parent_id, PARENT_SESSION);
+    assert.equal(child.workdir, "D:/fake-workspace");
+    assert.equal(child.origin, "subagent");
+    assert.equal(child.status, "not-loaded");
+    assert.equal(child.workspace, WS_SLUG);
+    const parent = workspaceRows.find((row) => row.id === PARENT_SESSION);
+    assert.ok(parent !== undefined, "应列出父会话自身");
+    assert.equal(parent.parent_id, undefined, "顶层会话没有 parent_id");
+    assert.equal(parent.status, "inactive");
+  });
+
+  await checkAsync("R4 渲染能看清谁是谁的子会话", () => {
+    const rendered = workspaceCtx.tools
+      .get("list_sessions")
+      .output.render({ scope: "workspace" }, workspaceRows)
+      .map((part) => part.text)
+      .join("");
+    assert.match(rendered, new RegExp(`${INBOX_SESSION} \\[not-loaded\\] \\(child of ${PARENT_SESSION}\\)`));
+    assert.match(rendered, /\(top-level\)/);
+  });
+
+  await checkAsync("R4 scope 默认值仍是 children（向后兼容）", async () => {
+    const legacyRows = await workspaceCtx.tools.get("list_sessions").execute({}, { agent: { id: PARENT_SESSION } });
+    assert.deepEqual(legacyRows, [{ id: "child-session-0001", label: "reviewer", status: "inactive", role: "child" }]);
+  });
+
+  // ---- R3：跨父投递 ----
+  const crossConfig = Config({ enabled: true, provider: "spawn", rules: [], persistWakeState: false });
+  const lineageError = 'subagent "other-parent-child" belongs to another parent session';
+  const controllerCalls = [];
+  const signalController = {
+    async prompt(request, signal) {
+      // 真实服务签名是 prompt(request, signal)：第二参必须是 AbortSignal
+      if (typeof signal?.throwIfAborted !== "function") throw new TypeError("signal.throwIfAborted is not a function");
+      controllerCalls.push({ request, arg: signal });
+      return { accepted: true };
+    },
+  };
+  const crossCtx = makeCtx(crossConfig, {
+    postFailure: { "other-parent-child": lineageError, "broken-target": "boom: transport is down" },
+    sessionController: signalController,
+  });
+
+  await checkAsync("R3 默认路径：血缘拒收原样抛出（不带 cross_parent 不放行）", async () => {
+    await assert.rejects(
+      crossCtx.tools.get("post_to_session").execute({ session_id: "other-parent-child", message: "同步边界" }, { agent: { id: PARENT_SESSION } }),
+      /belongs to another parent session/,
+    );
+    assert.equal(controllerCalls.length, 0, "默认路径不该碰 controller");
+  });
+
+  await checkAsync("R3 cross_parent:true 回落到 controller，via:'controller' 且正文带来源前缀", async () => {
+    const result = await crossCtx.tools
+      .get("post_to_session")
+      .execute({ session_id: "other-parent-child", message: "两个会话别改同一个仓库", cross_parent: true }, { agent: { id: PARENT_SESSION } });
+    assert.equal(result.via, "controller");
+    assert.match(result.messageId, /^controller-/);
+    assert.equal(controllerCalls.length, 1);
+    const { request } = controllerCalls[0];
+    assert.equal(request.sessionId, "other-parent-child");
+    assert.equal(request.mode, "queue");
+    assert.match(request.content[0].text, /^\[来自会话 session-parent 的消息\]\n两个会话别改同一个仓库$/);
+  });
+
+  await checkAsync("R3 默认路径仍走 subagent（via:'subagent'，保留 agent-message 来源）", async () => {
+    const result = await crossCtx.tools
+      .get("post_to_session")
+      .execute({ session_id: "child-session-0001", message: "接着干" }, { agent: { id: PARENT_SESSION } });
+    assert.equal(result.via, "subagent");
+    assert.equal(result.messageId, "inbox-message-0001");
+  });
+
+  await checkAsync("R3 非血缘错误在 cross_parent 下照旧抛出", async () => {
+    await assert.rejects(
+      crossCtx.tools
+        .get("post_to_session")
+        .execute({ session_id: "broken-target", message: "x", cross_parent: true }, { agent: { id: PARENT_SESSION } }),
+      /transport is down/,
+    );
+  });
+
+  await checkAsync("R3 controller 只认 (request, source) 时也能投递", async () => {
+    const sourceOnlyCalls = [];
+    const sourceOnlyController = {
+      async prompt(request, arg) {
+        if (arg?.kind !== name) throw new Error("expected a MessageSource here");
+        sourceOnlyCalls.push(request);
+      },
+    };
+    const altCtx = makeCtx(crossConfig, {
+      postFailure: { "other-parent-child": lineageError },
+      sessionController: sourceOnlyController,
+    });
+    const result = await altCtx.tools
+      .get("post_to_session")
+      .execute({ session_id: "other-parent-child", message: "备用签名", cross_parent: true }, { agent: { id: PARENT_SESSION } });
+    assert.equal(result.via, "controller");
+    assert.equal(sourceOnlyCalls.length, 1);
+  });
+
+  // ---- R3 通信权限矩阵：先判后投（真实会话 id + 真实父子关系做元数据来源）----
+  const matrixCalls = [];
+  const matrixController = {
+    async prompt(request, signal) {
+      if (typeof signal?.throwIfAborted !== "function") throw new TypeError("signal.throwIfAborted is not a function");
+      matrixCalls.push({ request });
+      return { accepted: true };
+    },
+  };
+  const matrixCtx = makeCtx(crossConfig, { sessionController: matrixController });
+  const matrixPost = (args, agentId) =>
+    matrixCtx.tools.get("post_to_session").execute(args, { agent: { id: agentId } });
+  const sentCount = () => matrixCtx.messages.length;
+  const controllerCount = () => matrixCalls.length;
+
+  await checkAsync("R3 矩阵① 父→自己的子会话：via:'subagent'（来源保真）", async () => {
+    const sentBefore = sentCount();
+    const controllerBefore = controllerCount();
+    const result = await matrixPost({ session_id: CHILD_A, message: "继续干活" }, TOP_A);
+    assert.equal(result.via, "subagent");
+    assert.equal(result.messageId, "inbox-message-0001");
+    assert.equal(sentCount(), sentBefore + 1, "应走 subagents.sendMessage");
+    assert.equal(controllerCount(), controllerBefore, "不该碰 controller");
+    assert.equal(matrixCtx.messages.at(-1).target, CHILD_A);
+    assert.match(matrixCtx.messages.at(-1).content[0].text, new RegExp(`^\\[来自会话 ${TOP_A} 的消息\\]\\n继续干活$`));
+  });
+
+  await checkAsync("R3 矩阵② 父→别人的子会话：明确拒绝，且不碰 sendMessage / controller", async () => {
+    const sentBefore = sentCount();
+    const controllerBefore = controllerCount();
+    await assert.rejects(matrixPost({ session_id: CHILD_A, message: "越界", cross_parent: true }, TOP_B), (error) => {
+      assert.match(error.message, /别的父会话的子会话/);
+      assert.match(error.message, new RegExp(`属 ${TOP_A}`));
+      assert.match(error.message, /父↔父/);
+      return true;
+    });
+    assert.equal(sentCount(), sentBefore, "拒绝路径不该调用 sendMessage");
+    assert.equal(controllerCount(), controllerBefore, "拒绝路径不该调用 controller");
+  });
+
+  await checkAsync("R3 矩阵③ 子→同级兄弟：明确拒绝，且不碰 sendMessage / controller", async () => {
+    const sentBefore = sentCount();
+    const controllerBefore = controllerCount();
+    await assert.rejects(matrixPost({ session_id: SIBLING_A, message: "兄弟私聊", cross_parent: true }, CHILD_A), (error) => {
+      assert.match(error.message, /别的父会话的子会话/);
+      assert.match(error.message, /同级兄弟/);
+      return true;
+    });
+    assert.equal(sentCount(), sentBefore);
+    assert.equal(controllerCount(), controllerBefore);
+  });
+
+  await checkAsync("R3 矩阵④ 父↔父（顶层↔顶层）：via:'controller'", async () => {
+    const sentBefore = sentCount();
+    const controllerBefore = controllerCount();
+    const result = await matrixPost({ session_id: TOP_B, message: "两个会话别改同一个仓库" }, TOP_A);
+    assert.equal(result.via, "controller");
+    assert.match(result.messageId, /^controller-/);
+    assert.equal(sentCount(), sentBefore, "顶层目标不该先试注定失败的血缘路径");
+    assert.equal(controllerCount(), controllerBefore + 1);
+    const { request } = matrixCalls.at(-1);
+    assert.equal(request.sessionId, TOP_B);
+    assert.equal(request.mode, "queue");
+    assert.match(request.content[0].text, new RegExp(`^\\[来自会话 ${TOP_A} 的消息\\]\\n两个会话别改同一个仓库$`));
+  });
+
+  await checkAsync("R3 矩阵⑤ 子→自己的父会话：回报通道仍可用（sendMessage）", async () => {
+    const sentBefore = sentCount();
+    const controllerBefore = controllerCount();
+    const result = await matrixPost({ session_id: TOP_B, message: "阶段回报" }, CHILD_B);
+    assert.equal(result.via, "subagent");
+    assert.equal(sentCount(), sentBefore + 1);
+    assert.equal(controllerCount(), controllerBefore);
+    assert.equal(matrixCtx.messages.at(-1).target, TOP_B);
+  });
+
+  await checkAsync("R3 矩阵补充：子→别的顶层会话 拒绝；父↔父 显式 cross_parent:false 拒绝", async () => {
+    const sentBefore = sentCount();
+    const controllerBefore = controllerCount();
+    await assert.rejects(matrixPost({ session_id: TOP_B, message: "x" }, CHILD_A), /不能投给顶层会话/);
+    await assert.rejects(
+      matrixPost({ session_id: TOP_B, message: "x", cross_parent: false }, TOP_A),
+      /cross_parent: false/,
+    );
+    assert.equal(sentCount(), sentBefore);
+    assert.equal(controllerCount(), controllerBefore);
+  });
+
+  // ---- 输出契约：真实 harness 会拿 output.schema 校验每个成功返回值 ----
+  await checkAsync("输出契约：query_session / get_session_inbox / list_sessions / post_to_session 都过 schema", async () => {
+    const queryValue = await inboxCtx.tools
+      .get("query_session")
+      .execute({ session_id: INBOX_SESSION }, { agent: { id: PARENT_SESSION } });
+    assertOutputContract(inboxCtx.tools, "query_session", queryValue);
+    assertOutputContract(inboxCtx.tools, "get_session_inbox", inbox);
+    assertOutputContract(inboxCtx.tools, "list_sessions", [
+      { id: "child-session-0001", label: "reviewer", status: "running", role: "child" },
+    ]);
+    assertOutputContract(workspaceCtx.tools, "list_sessions", workspaceRows);
+    const crossResult = await crossCtx.tools
+      .get("post_to_session")
+      .execute({ session_id: "other-parent-child", message: "再来一条", cross_parent: true }, { agent: { id: PARENT_SESSION } });
+    assertOutputContract(crossCtx.tools, "post_to_session", crossResult);
+  });
+
+  console.log(results.slice(firstNew).join("\n"));
+};
+
 run()
   .then(wakeCheck)
+  .then(deliveryCheck)
+  .then(() => {
+    const failed = results.filter((line) => line.startsWith("FAIL"));
+    console.log("");
+    console.log(`[smoke] ${results.length - failed.length} passed, ${failed.length} failed (total ${results.length})`);
+    if (failed.length > 0) console.log(failed.join("\n"));
+  })
   .catch((error) => {
     process.exitCode = 1;
     console.log(results.join("\n"));
