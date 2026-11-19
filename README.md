@@ -31,7 +31,7 @@ The second one shows the round trip the parent cares about: the child restates t
 | 1 | **Child sessions you can create directly** — right-click a session → *Create child session*, or `/vibe-spawn label\|task`, or the plugin's own panel | registers a host command (`ctx.commands.register`) and starts the activation; the child's first message is your task text, not a wrapper prompt | no |
 | 2 | **Parent gets the child id** — one notice per **assigned** run, batched, carrying session id + status | `subagents.startActivation` with `delivery: "caller"`, then `agent.followup`; a debounce window merges children that finish together. A child run counts as assigned when this plugin started it or the parent messaged it (`post_to_session`); your own turns inside the child never notify the parent | no |
 | 3 | **`query_session`** — read another session's recent rounds from its persisted log | streams the JSONL session log, replays its multi-frame zstd, renders rounds + tool summary | no |
-| 4 | **`post_to_session` / `stop_session` / `list_sessions`** | thin, consistent wrappers over the subagent service, with a pre-flight **communication matrix** (own child ✅ · parent↔parent ✅ · another parent's child ❌ · sibling ❌ · own parent ✅); `list_sessions(scope: 'workspace')` reads every persisted session with its `parent_id`/`workdir` | no |
+| 4 | **`post_to_session` / `stop_session` / `list_sessions`** | thin, consistent wrappers over the subagent service, with a pre-flight **communication matrix** (own child ✅ · parent↔parent ✅ · another parent's child ❌ · sibling ❌ · own parent ✅) and `notify: 'once' \| 'never'` (subscribe to one receipt, or deliver without any notice); `list_sessions(scope: 'workspace')` reads every persisted session with its `parent_id`/`workdir` | no |
 | 5 | **Delivery is visible and auditable** — `[inject]` blocks in `query_session`, three-state inbox replay (`queued`/`consumed`/`dropped`) and a `get_session_inbox` queue view | replays `agent/inbox/spliced` from the session log; no new event, no host change | no |
 | 6 | **Turn-cadence prompt nudges** (碎碎念) | `agent/pre-step` injects a reminder at chosen turns; the text is re-read from disk each time; identical repeats collapse to a one-line marker | no |
 | 7 | **Wake state survives restarts** | `<DSH_HOME>/vibe-bridge/wake-state.json`, atomic writes, 12 h TTL, compensation on startup | no |
@@ -45,12 +45,13 @@ A child gives the parent a notice only when the parent asked for that run:
 
 | Who started the child's turn | Notice? |
 |---|---|
-| this plugin (`spawn_session`, the *Create child session* dialog, `/vibe-spawn`) | yes — once, when that activation settles |
-| the parent messaging it again (`post_to_session`) | yes — once per message: the plugin re-arms the child, so the first settle after the message reports back |
+| this plugin (`spawn_session`, the *Create child session* dialog, `/vibe-spawn`) | yes — once, when that activation settles; worded as **work you assigned** |
+| the parent messaging it again (`post_to_session`, `notify: 'once'` — the default) | yes — once per message: the plugin re-arms the child, so the first settle after the message reports back; worded as a **subscription receipt** |
+| the parent messaging it with `post_to_session({ notify: 'never' })` | **no** — delivered without arming, so that message never produces a notice |
 | you, typing in the child's own conversation | **no** — the child is not armed, so the parent is left alone |
 | the child continuing work on its own after a notice | no |
 
-That is the `armed` flag in `wake-state.json`: it is set when the plugin spawns a child or the parent posts to it, cleared when the notice is queued, and it is what a restart compensates for. So opening a child and chatting with it does not spam its parent, while a task you actually assigned always comes back with its session id.
+That is the `armed` flag in `wake-state.json`: it is set when the plugin spawns a child or the parent posts to it, cleared when the notice is queued, and it is what a restart compensates for. So opening a child and chatting with it does not spam its parent, while a task you actually assigned always comes back with its session id. The **reason** (`spawn` or `post`) is persisted next to that flag too, so a notice restored after a restart is still worded correctly.
 
 ## Install the plugin
 
@@ -111,7 +112,7 @@ The plugin reads its config from the profile's `cordis.patch.yml`:
 | Tool | Model-visible contract |
 |---|---|
 | `spawn_session(prompt, label?, cwd?)` | starts a child; returns `session started: <childSessionId>` |
-| `post_to_session(session_id, message, stop_current?, cross_parent?)` | delivers a message to a session, but only where the communication matrix allows it (own child / own parent / parent↔parent); prefixes `[来自会话 <id> 的消息]`; `stop_current` interrupts a running target first (direct children only); `cross_parent` is a parent↔parent switch only (top-level targets) and the result reports `via: 'subagent' \| 'controller'`; another parent's child or a sibling is refused before anything is sent |
+| `post_to_session(session_id, message, stop_current?, cross_parent?, notify?)` | delivers a message to a session, but only where the communication matrix allows it (own child / own parent / parent↔parent); prefixes `[来自会话 <id> 的消息]`; `stop_current` interrupts a running target first (direct children only); `cross_parent` is a parent↔parent switch only (top-level targets); `notify` (default `'once'`) subscribes the target's next settle as a **subscription receipt**, `'never'` delivers without subscribing; returns `{messageId, via, notify}`; another parent's child or a sibling is refused before anything is sent |
 | `list_sessions(scope?)` | `scope: 'children'` (default) → `{id, label, status, role: parent\|child}`; `scope: 'workspace'` → every session in the session store with `{id, label, status, origin, parent_id?, workdir, workspace}` |
 | `query_session(session_id, tail?, include_tools?, verbose?)` | header + the last `tail` rounds, including an `[inject]` section for messages other sessions injected; `verbose` adds model/provider/workdir and longer excerpts |
 | `get_session_inbox(session_id)` | what is still queued in another session's inbox: `{position, target, source_kind, sender_session_id?, queued_at, preview}` |
@@ -120,7 +121,7 @@ The plugin reads its config from the profile's `cordis.patch.yml`:
 
 The host command `/vibe-spawn <label>|<task>` backs the UI's *Create child session* action, so creating a child never costs a parent model turn.
 
-## Delivery visibility: injects, three states, cross-parent post, workspace scope
+## Delivery visibility: injects, three states, who-may-message-whom, notices, workspace scope
 
 DSH writes every inbox mutation to the session log as `agent/inbox/spliced`. That is the audit trail this plugin
 reads — no new event, no monkey-patching.
@@ -229,7 +230,28 @@ plugin surface offers no other write path into another session's inbox. Enabling
 relax `authorizeLineage` (`packages/subagent/subagent/src/manager.ts:713-722`) so a non-ancestor sender can be
 explicitly authorized, or let the controller resolve `origin: 'subagent'` sessions for an attested caller.
 
-### 4. `list_sessions(scope: 'workspace')`
+### 4. Completion notices: dispatch vs subscription
+
+A completion notice is a **receipt about the child's turn**, not a claim that the child worked for you. The plugin
+records *why* it armed the child and words the notice accordingly, so the two meanings stop looking identical:
+
+| Arm reason | Set by | Notice wording |
+|---|---|---|
+| `spawn` (dispatch) | `spawn_session`, the *Create child session* dialog, `/vibe-spawn` | `会话「…」完成了新一轮工作。` — that run **was** the task you assigned |
+| `post` (subscription) | `post_to_session` with `notify: 'once'` (the default) | `会话「…」跑完了…。这一条是 post_to_session 的订阅回执 —— 只表示它跑完了一轮，不代表这一轮是为你那条消息专门做的，也不代表你收到了它的全部工作。` |
+
+Why the distinction matters: a top-level peer session keeps doing its own work after your message, so every one of
+its turns would otherwise arrive as "completed a new round of work" — indistinguishable from a task you dispatched.
+With `notify: 'once'` you get exactly one receipt (the first settle after delivery) and nothing more; with
+`notify: 'never'` the message is delivered without arming the target at all, so it produces no notice and does not
+disturb an existing notice state either.
+
+Batched notices keep the same distinction: a single-child notice uses the wording above, and a merged notice lists
+`（订阅回执）` next to subscribed children and states `含 N 条订阅回执` when dispatch and subscription results arrive
+in the same debounce window. The reason is persisted in `wake-state.json`, so a notice restored by the restart
+compensation is worded correctly too.
+
+### 5. `list_sessions(scope: 'workspace')`
 
 `scope: 'workspace'` scans `<DSH_HOME>/sessions/*/*` and reads each log's **first event** (`type: 'session'`), which
 is where `parentSession`, `cwd`, `origin` and `delegationDepth` actually live — `request/header` does not carry them.

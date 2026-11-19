@@ -34,7 +34,7 @@
 | 1 | **直接建子会话** —— 右键任一会话 →「创建子会话」，或用 `/vibe-spawn 名字\|任务`，或用插件面板 | 注册宿主命令（`ctx.commands.register`）后直接 `startActivation`；子会话收到的第一条消息就是任务原文，不是"请去创建子会话"的转述 | 否 |
 | 2 | **父会话拿到子会话 id** —— 每次**被指派的运行**完成一条通知，带 id + 状态，同批合并 | `subagents.startActivation` 配 `delivery: "caller"`，再用 `agent.followup` 投递；合并窗口把同时收工的多个子会话压成一条。只有"本插件建出来的"或"父会话用 `post_to_session` 投过任务的"运行才算指派；你自己在子会话里聊的轮次不会回报父会话 | 否 |
 | 3 | **`query_session`** —— 读另一个会话最近几轮 | 流式读 JSONL 会话日志、按魔数切多帧 zstd、渲染轮次与工具摘要 | 否 |
-| 4 | **`post_to_session` / `stop_session` / `list_sessions`** | 对 subagent 服务的薄封装 + **投递前先判通信矩阵**（自己的子 ✅ · 父↔父 ✅ · 别人的子 ❌ · 同级兄弟 ❌ · 自己的父 ✅）；`list_sessions(scope: 'workspace')` 读出会话库里每个会话的 `parent_id`/`workdir` | 否 |
+| 4 | **`post_to_session` / `stop_session` / `list_sessions`** | 对 subagent 服务的薄封装 + **投递前先判通信矩阵**（自己的子 ✅ · 父↔父 ✅ · 别人的子 ❌ · 同级兄弟 ❌ · 自己的父 ✅）与 `notify: 'once' \| 'never'`（订一条回执，或投递但不产生任何通知）；`list_sessions(scope: 'workspace')` 读出会话库里每个会话的 `parent_id`/`workdir` | 否 |
 | 5 | **投递可见又可审计** —— `query_session` 的 `[inject]` 段、三态重放（`queued`/`consumed`/`dropped`）、`get_session_inbox` 队列视图 | 重放会话日志里的 `agent/inbox/spliced`；不新增事件、不改宿主 | 否 |
 | 6 | **轮次碎碎念** | `agent/pre-step` 在指定轮次注入提醒；文案每轮从磁盘重读（改文件即时生效）；连续相同内容折叠成一行标记 | 否 |
 | 7 | **唤醒状态落盘** | `<DSH_HOME>/vibe-bridge/wake-state.json`，原子写、12 小时 TTL、启动补偿 | 否 |
@@ -48,12 +48,13 @@
 
 | 谁发起的这一轮 | 会不会回报 |
 |---|---|
-| 本插件（`spawn_session`、面板「创建子会话」、`/vibe-spawn`） | 会 —— 该 activation 收尾时回报一次 |
-| 父会话再给它投任务（`post_to_session`） | 会 —— 每条消息回报一次：投递时重新 arm，投完的第一次收尾就回报 |
+| 本插件（`spawn_session`、面板「创建子会话」、`/vibe-spawn`） | 会 —— 该 activation 收尾时回报一次；措辞是**派给你的活** |
+| 父会话再给它投任务（`post_to_session`，`notify: 'once'` 默认） | 会 —— 每条消息回报一次：投递时重新 arm，投完的第一次收尾就回报；措辞是**订阅回执** |
+| 父会话用 `post_to_session({ notify: 'never' })` 投递 | **不会** —— 只投递不 arm，那条消息不产生任何通知 |
 | **你自己**在子会话里打字聊天 | **不会** —— 子会话没被 arm，父会话不受打扰 |
 | 子会话回报之后自己继续干活 | 不会 |
 
-这就是 `wake-state.json` 里的 `armed` 标记：插件建子会话或父会话投递时置上，通知入队时清掉，重启补偿也只补"还 armed 且没回报过"的条目。所以打开子会话随便聊不会惊动它的父会话，而真正派下去的活一定会带着 session id 回来。
+这就是 `wake-state.json` 里的 `armed` 标记：插件建子会话或父会话投递时置上，通知入队时清掉，重启补偿也只补"还 armed 且没回报过"的条目。所以打开子会话随便聊不会惊动它的父会话，而真正派下去的活一定会带着 session id 回来。**arm 的原因**（`spawn` / `post`）也一起落盘，所以重启后补发的通知措辞同样正确。
 
 ## 安装（插件部分）
 
@@ -112,7 +113,7 @@ Windows 上依赖联接用的是目录 junction，不需要管理员权限、也
 | 工具 | 模型可见的契约 |
 |---|---|
 | `spawn_session(prompt, label?, cwd?)` | 建子会话，返回 `session started: <childSessionId>` |
-| `post_to_session(session_id, message, stop_current?, cross_parent?)` | 给某个会话投一条消息，但只投通信矩阵允许的格子（自己的子 / 自己的父 / 父↔父）；前缀 `[来自会话 <id> 的消息]`；`stop_current` 先中断正在跑的直接子会话；`cross_parent` 只是父↔父开关（目标必须是顶层会话），返回 `via: 'subagent' \| 'controller'`；别人的子会话、同级兄弟会在投递前被明确拒绝 |
+| `post_to_session(session_id, message, stop_current?, cross_parent?, notify?)` | 给某个会话投一条消息，但只投通信矩阵允许的格子（自己的子 / 自己的父 / 父↔父）；前缀 `[来自会话 <id> 的消息]`；`stop_current` 先中断正在跑的直接子会话；`cross_parent` 只是父↔父开关（目标必须是顶层会话）；`notify`（默认 `'once'`）订阅对方向下一次收尾的**订阅回执**，`'never'` 只投递不订阅；返回 `{messageId, via, notify}`；别人的子会话、同级兄弟会在投递前被明确拒绝 |
 | `list_sessions(scope?)` | `scope: 'children'`（默认）→ `{id, label, status, role: parent\|child}`；`scope: 'workspace'` → 会话库里所有会话，带 `{id, label, status, origin, parent_id?, workdir, workspace}` |
 | `query_session(session_id, tail?, include_tools?, verbose?)` | 头部信息 + 最近 `tail` 轮；新增 `[inject]` 段显示别的会话注入的消息；`verbose` 才给模型/供应商/工作目录与更长的正文 |
 | `get_session_inbox(session_id)` | 别的会话还没被消费的队列：`{position, target, source_kind, sender_session_id?, queued_at, preview}` |
@@ -121,7 +122,7 @@ Windows 上依赖联接用的是目录 junction，不需要管理员权限、也
 
 宿主命令 `/vibe-spawn <名字>|<任务>` 就是界面里「创建子会话」背后的那条路径 —— 所以建子会话不消耗父会话的任何模型轮次。
 
-## 投递可见性：注入段、三态、跨父投递、workspace 列表
+## 投递可见性：注入段、三态、谁能给谁发、通知来源、workspace 列表
 
 DSH 把每一次 inbox 变更都写进会话日志（`agent/inbox/spliced`）。这就是本插件读的审计流水 —— 不新增事件、不改宿主代码。
 
@@ -198,7 +199,21 @@ controller 写死 `source.kind = 'user'`，所以父↔父消息靠正文前缀 
 这是 DSH 核心的设计取舍（子会话没有「API owner」），插件层绕不过去 —— 插件可用的写入通道只有这一条。
 要开启这一格，需要上游改动：要么放宽 `authorizeLineage`（`packages/subagent/subagent/src/manager.ts:713-722`）允许显式授权的非祖先发送方，要么让 controller 对经认证的调用方解开 `origin: 'subagent'` 的解析限制。
 
-### 4. `list_sessions(scope: 'workspace')`
+### 4. 完成通知：派单 vs 订阅
+
+一条完成通知是**对方那一轮的收据**，不是"它为你干了活"的宣告。插件记下自己**为什么** arm 那个会话，并据此决定措辞，让这两件事不再长得一样：
+
+| arm 原因 | 谁置上的 | 通知措辞 |
+|---|---|---|
+| `spawn`（派单） | `spawn_session`、面板「创建子会话」、`/vibe-spawn` | `会话「…」完成了新一轮工作。` —— 这一轮**就是**你派下去的活 |
+| `post`（订阅） | `post_to_session` 且 `notify: 'once'`（默认） | `会话「…」…这一条是 post_to_session 的订阅回执 —— 只表示它跑完了一轮，不代表这一轮是为你那条消息专门做的，也不代表你收到了它的全部工作。` |
+
+为什么必须区分：你投给一个**顶层对等会话**之后，它仍在做自己的事，于是它每一轮收尾都会回一条"完成了新一轮工作"—— 跟你派下去的活长得一模一样，看起来就是噪音。
+`notify: 'once'` 只给一条回执（投递后第一次收尾），之后不再打扰；`notify: 'never'` 连 arm 都不做，那条消息不产生任何通知，也不会改动已有的通知状态。
+
+合并通知沿用同一套区分：只有一个子会话时用上面的措辞；合并时在被订阅的子会话后面标 `（订阅回执）`，若派单与订阅结果落在同一个合并窗口里，首行会写 `含 N 条订阅回执`。arm 原因会落盘进 `wake-state.json`，所以重启补偿补发的通知措辞同样正确。
+
+### 5. `list_sessions(scope: 'workspace')`
 
 `scope: 'workspace'` 扫 `<DSH_HOME>/sessions/*/*`，读每个日志的**第一条事件**（`type: 'session'`）—— `parentSession` / `cwd` / `origin` / `delegationDepth` 都只写在那里，`request/header` 里没有。
 每个日志只读、只解开头 256 KB，所以 80 个会话的完整列表也在 1 秒内。

@@ -1012,9 +1012,114 @@ const deliveryCheck = async () => {
   console.log(results.slice(firstNew).join("\n"));
 };
 
+// ---------------------------------------------------------------------------
+// 通知语义：notify = once / never，以及按 arm 原因（派单 vs 订阅）区分的措辞
+// ---------------------------------------------------------------------------
+const notifyCheck = async () => {
+  const firstNew = results.length;
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const noticeText = (entry) => entry.message.content.map((part) => part.text).join("");
+  const makeWakeCtx = (statuses, overrides = {}) =>
+    makeCtx(
+      Config({
+        enabled: true,
+        provider: "spawn",
+        rules: [],
+        wakePollMs: 40,
+        wakeDebounceMs: 60,
+        wakeParentOnChildFinish: true,
+        persistWakeState: false,
+        ...overrides,
+      }),
+      { agentsStatus: statuses },
+    );
+
+  // ① notify:'never' —— 投递但不订阅
+  const neverStatuses = { [PARENT_SESSION]: "inactive", "child-session-0002": "running" };
+  const neverCtx = makeWakeCtx(neverStatuses);
+  const neverResult = await neverCtx.tools.get("post_to_session").execute(
+    { session_id: "child-session-0002", message: "看一眼就好，别回执", notify: "never" },
+    { agent: { id: PARENT_SESSION } },
+  );
+  await sleep(150); // 让哨兵看到它确实在跑
+  neverStatuses["child-session-0002"] = "inactive";
+  await sleep(350);
+  await checkAsync("通知① notify:'never'：投递成功、不订阅，收尾不产生任何通知", () => {
+    assert.equal(neverResult.via, "subagent");
+    assert.equal(neverResult.notify, "never");
+    assert.equal(neverCtx.woke.length, 0, `不该有任何回报，实际 ${neverCtx.woke.length}`);
+    const rendered = neverCtx.tools
+      .get("post_to_session")
+      .output.render({ session_id: "child-session-0002" }, neverResult)
+      .map((part) => part.text)
+      .join("");
+    assert.match(rendered, /completion notice: not subscribed/);
+  });
+
+  // ② notify 默认 'once' —— 订阅一次，措辞是“订阅回执”
+  const onceStatuses = { [PARENT_SESSION]: "inactive", "child-session-0002": "running" };
+  const onceCtx = makeWakeCtx(onceStatuses);
+  const onceResult = await onceCtx.tools.get("post_to_session").execute(
+    { session_id: "child-session-0002", message: "订阅一下" },
+    { agent: { id: PARENT_SESSION } },
+  );
+  await sleep(150);
+  onceStatuses["child-session-0002"] = "inactive";
+  await sleep(350);
+  await checkAsync("通知② notify:'once'（默认）：收尾回报 1 条，措辞是“订阅回执”", () => {
+    assert.equal(onceResult.notify, "once");
+    assert.equal(onceCtx.woke.length, 1, `应恰好 1 条，实际 ${onceCtx.woke.length}`);
+    const text = noticeText(onceCtx.woke[0]);
+    assert.match(text, /订阅回执/);
+    assert.match(text, /不代表这一轮是为你那条消息专门做的/);
+    assert.match(text, /notify: "never"/);
+    const rendered = onceCtx.tools
+      .get("post_to_session")
+      .output.render({ session_id: "child-session-0002" }, onceResult)
+      .map((part) => part.text)
+      .join("");
+    assert.match(rendered, /completion notice: subscribed/);
+  });
+
+  // ③ spawn 派单的回报保持原措辞（回归）
+  const spawnStatuses = { [PARENT_SESSION]: "inactive" };
+  const spawnCtx = makeWakeCtx(spawnStatuses);
+  await spawnCtx.tools.get("spawn_session").execute({ prompt: "跑个真任务", label: "派单" }, { agent: { id: PARENT_SESSION } });
+  await sleep(400);
+  await checkAsync("通知③ spawn 派单的回报不含“订阅回执”（措辞回归）", () => {
+    assert.equal(spawnCtx.woke.length, 1);
+    const text = noticeText(spawnCtx.woke[0]);
+    assert.match(text, /完成了新一轮工作/);
+    assert.match(text, /要它继续就 post_to_session/);
+    assert.doesNotMatch(text, /订阅回执/);
+  });
+
+  // ④ 合并通知里混有订阅回执 → 中性措辞 + 标明条数
+  const mixedStatuses = { [PARENT_SESSION]: "inactive", "child-session-0001": "running", "child-session-0002": "running" };
+  const mixedCtx = makeWakeCtx(mixedStatuses, { wakeDebounceMs: 400 });
+  await mixedCtx.tools.get("spawn_session").execute({ prompt: "甲任务", label: "甲" }, { agent: { id: PARENT_SESSION } });
+  await mixedCtx.tools
+    .get("post_to_session")
+    .execute({ session_id: "child-session-0002", message: "订阅乙" }, { agent: { id: PARENT_SESSION } });
+  await sleep(150);
+  mixedStatuses["child-session-0001"] = "inactive";
+  mixedStatuses["child-session-0002"] = "inactive";
+  await sleep(700);
+  await checkAsync("通知④ 合并通知混有订阅回执时标明“含 1 条订阅回执”", () => {
+    assert.equal(mixedCtx.woke.length, 1, `合并窗口内应只有 1 条通知，实际 ${mixedCtx.woke.length}`);
+    const text = noticeText(mixedCtx.woke[0]);
+    assert.match(text, /2 个子会话/);
+    assert.match(text, /含 1 条订阅回执/);
+    assert.match(text, /（订阅回执）/);
+  });
+
+  console.log(results.slice(firstNew).join("\n"));
+};
+
 run()
   .then(wakeCheck)
   .then(deliveryCheck)
+  .then(notifyCheck)
   .then(() => {
     const failed = results.filter((line) => line.startsWith("FAIL"));
     console.log("");
