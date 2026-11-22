@@ -45,28 +45,63 @@ if (argv.includes('--uninstall')) {
 
 const modules = resolveDshModules(argv)
 
-// 1) The package itself: host half, client half, package manifest, nudge copy.
-mkdirSync(path.join(target, 'lib'), { recursive: true })
-mkdirSync(path.join(target, 'test'), { recursive: true })
-for (const file of ['index.js', 'client.js']) {
-  copyFileSync(path.join(root, 'lib', file), path.join(target, 'lib', file))
+/**
+ * A pnpm-managed profile prunes anything in its `node_modules` that its
+ * `package.json` does not declare, so a hand-copied package disappears on the
+ * next install. When the profile has a manifest, register a `link:` dependency
+ * instead and let pnpm own the placement; the package's own `@deepseek-ai`
+ * link then lives in this repository.
+ * @returns whether pnpm installed the link.
+ */
+const linkIntoProfile = () => {
+  const manifest = path.join(profile, 'package.json')
+  if (!existsSync(manifest)) return false
+  const parsed = JSON.parse(readFileSync(manifest, 'utf8').replace(/^\uFEFF/, ''))
+  if (parsed?.dependencies === undefined || typeof parsed.dependencies !== 'object') return false
+  const specifier = `link:${root.replaceAll('\\', '/')}`
+  if (parsed.dependencies['dsh-vibe-bridge'] === specifier) {
+    console.log(`already linked in ${manifest}: ${specifier}`)
+    return true
+  }
+  execFileSync('pnpm', ['add', specifier, '--config.confirmModulesPurge=false'], {
+    cwd: profile,
+    stdio: 'inherit',
+    shell: process.platform === 'win32',
+  })
+  console.log(`linked ${specifier} into ${manifest}`)
+  return true
 }
-for (const file of ['package.json', 'nudge.md']) {
-  copyFileSync(path.join(root, file), path.join(target, file))
-}
-for (const file of readdirSync(path.join(root, 'test')).filter(name => name.endsWith('.mjs'))) {
-  copyFileSync(path.join(root, 'test', file), path.join(target, 'test', file))
-}
-console.log(`installed package -> ${target}`)
 
-// 2) Dependencies resolve to the host's own modules.
-const depLink = path.join(target, 'node_modules', '@deepseek-ai')
-mkdirSync(path.dirname(depLink), { recursive: true })
-if (existsSync(depLink)) {
-  unlinkSync(depLink)
+if (!existsSync(path.join(root, 'node_modules', '@deepseek-ai'))) {
+  symlinkSync(path.join(modules, '@deepseek-ai'), path.join(root, 'node_modules', '@deepseek-ai'),
+    process.platform === 'win32' ? 'junction' : 'dir')
+  console.log(`linked ${path.join(root, 'node_modules', '@deepseek-ai')} -> ${path.join(modules, '@deepseek-ai')}`)
 }
-symlinkSync(path.join(modules, '@deepseek-ai'), depLink, process.platform === 'win32' ? 'junction' : 'dir')
-console.log(`linked ${depLink} -> ${path.join(modules, '@deepseek-ai')}`)
+
+if (!linkIntoProfile()) {
+  // 1) The package itself: host half, client half, package manifest, nudge copy.
+  mkdirSync(path.join(target, 'lib'), { recursive: true })
+  mkdirSync(path.join(target, 'test'), { recursive: true })
+  for (const file of ['index.js', 'client.js']) {
+    copyFileSync(path.join(root, 'lib', file), path.join(target, 'lib', file))
+  }
+  for (const file of ['package.json', 'nudge.md']) {
+    copyFileSync(path.join(root, file), path.join(target, file))
+  }
+  for (const file of readdirSync(path.join(root, 'test')).filter(name => name.endsWith('.mjs'))) {
+    copyFileSync(path.join(root, 'test', file), path.join(target, 'test', file))
+  }
+  console.log(`installed package -> ${target}`)
+
+  // 2) Dependencies resolve to the host's own modules.
+  const depLink = path.join(target, 'node_modules', '@deepseek-ai')
+  mkdirSync(path.dirname(depLink), { recursive: true })
+  if (existsSync(depLink)) {
+    unlinkSync(depLink)
+  }
+  symlinkSync(path.join(modules, '@deepseek-ai'), depLink, process.platform === 'win32' ? 'junction' : 'dir')
+  console.log(`linked ${depLink} -> ${path.join(modules, '@deepseek-ai')}`)
+}
 
 // 3) Smoke the two halves where they actually resolve from.
 for (const spec of ['test/smoke.mjs', 'test/client-smoke.mjs']) {

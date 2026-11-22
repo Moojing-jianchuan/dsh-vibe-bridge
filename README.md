@@ -67,7 +67,9 @@ npm test
 node tools/install.mjs --profile desktop --dsh "/path/to/dsh"
 ```
 
-`tools/install.mjs` copies the package into `<DSH_HOME>/profiles/<profile>/node_modules/dsh-vibe-bridge`, links its `@deepseek-ai` dependencies to your DSH installation (so both halves share one module instance), runs the smoke tests **in place**, and appends the `cordis.patch.yml` entry. Restart DSH for the host half, refresh the page for the client half.
+`tools/install.mjs` registers the package in the profile and links its `@deepseek-ai` dependencies to your DSH installation (so both halves share one module instance), runs the smoke tests **in place**, and appends the `cordis.patch.yml` entry. Restart DSH for the host half, refresh the page for the client half.
+
+**Let the profile's package manager own the package.** A pnpm-managed profile prunes anything its `package.json` does not declare, so a hand-copied `node_modules/dsh-vibe-bridge` silently disappears the next time DSH (or its plugin manager) reinstalls — the plugin then stops loading and its sidebar entry, right-click menu and tools all vanish at once. `tools/install.mjs` therefore adds a `link:<this repo>` dependency through the profile's own pnpm when the profile has a manifest, and only falls back to copying for a manifest-less profile.
 
 Windows note: linking uses a directory junction, so no admin rights and no developer mode are required.
 

@@ -70,7 +70,9 @@ npm test
 node tools/install.mjs --profile desktop --dsh "/path/to/dsh"
 ```
 
-`tools/install.mjs` 会把包复制到 `<DSH_HOME>/profiles/<profile>/node_modules/dsh-vibe-bridge`，把 `@deepseek-ai` 依赖联接到你的 DSH 安装（两半共用同一份模块实例），**在安装位置**跑一遍冒烟测试，最后往 `cordis.patch.yml` 追加插件条目。宿主半需要重启 DSH，客户端半刷新页面。
+`tools/install.mjs` 会把这个包注册进 profile，并把 `@deepseek-ai` 依赖联接到你的 DSH 安装（两半共用同一份模块实例），**在安装位置**跑一遍冒烟测试，最后往 `cordis.patch.yml` 追加插件条目。宿主半需要重启 DSH，客户端半刷新页面。
+
+**务必让 profile 的包管理器来拥有这个包。** 受 pnpm 管理的 profile 会 prune 掉 `package.json` 里没声明的任何 `node_modules` 内容 —— 手工复制进去的 `node_modules/dsh-vibe-bridge` 会在下次 DSH（或其插件管理器）重装时悄悄消失：插件不再被加载，侧栏入口、右键菜单、工具会**同时**整片消失。所以 `tools/install.mjs` 现在会在 profile 有 manifest 时，用 profile 自己的 pnpm 加一条 `link:<本仓库>` 依赖；只有无 manifest 的 profile 才回退到复制。
 
 Windows 上依赖联接用的是目录 junction，不需要管理员权限、也不需要开发者模式。
 
