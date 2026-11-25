@@ -29,9 +29,11 @@ const check = async (title, fn) => {
 // ---- 伪造模块加载器环境 ----
 let registration;
 const jsxRuntime = {
-  // 第三个参数（children 数组）是 React 自动 jsx 的常规写法，必须合并进 props，否则列表项会渲染成空壳。
-  jsx: (type, props, ...children) => ({ type, props: children.length === 0 ? props : { ...props, children } }),
-  jsxs: (type, props, ...children) => ({ type, props: children.length === 0 ? props : { ...props, children } }),
+  // React 的自动运行时签名是 `jsx(type, props, key)` —— 第三个参数是 **key**，不是 children。
+  // 旧桩把 rest 参数并进 children，于是"children 写错位置"的 bug 在测试里永远显示为通过
+  // （真机上表现为列表项渲染成空白条）。这里按真实语义实现：children 只能来自 props。
+  jsx: (type, props) => ({ type, props }),
+  jsxs: (type, props) => ({ type, props }),
   Fragment: "Fragment",
 };
 const reactStub = {
@@ -650,6 +652,12 @@ await check("按钮文案：暂停注入 vs 彻底删除（含规则与文案）
   assert.match(text, /暂停注入/);
   assert.match(text, /彻底删除（含规则与文案）/);
   assert.doesNotMatch(text, /清除/);
+});
+
+await check("jsx 桩与 React 一致：第三个参数不会变成 children", () => {
+  // 若桩又把第三个参数并进 children，下面这类真实 bug 会重新变成"测试通过、真机空白"。
+  const node = jsxRuntime.jsxs("div", { id: "x" }, ["child"]);
+  assert.equal(node.props.children, undefined, "children 只能来自 props.children");
 });
 
 console.log(results.join("\n"));
