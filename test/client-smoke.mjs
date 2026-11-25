@@ -44,6 +44,7 @@ class SettingsFormModelStub {
     this.scope = scope;
     this.specs = new Map(specs.map((spec) => [spec.field, spec]));
     this.staged = new Map();
+    this.savedValues = new Map();
     this.saved = 0;
     this.disposed = false;
     models.push(this);
@@ -51,21 +52,23 @@ class SettingsFormModelStub {
   field(name) {
     const spec = this.specs.get(name);
     const staged = this.staged.get(name);
-    return {
-      text: staged !== undefined ? staged : spec.format(this.scope?.value?.[name]),
-      overridden: false,
-      invalid: false,
-    };
+    const saved = this.savedValues.get(name);
+    const raw = saved !== undefined ? saved : this.scope?.value?.[name];
+    return { text: staged !== undefined ? staged : spec.format(raw), overridden: false, invalid: false };
   }
   shell() {
     return { available: true, writable: true, dirty: this.staged.size > 0, invalid: false, saving: false, failed: false };
   }
   actions() {
     return {
-      edit: (field, text) => this.staged.set(field, text),
+      edit: (field, text) => {
+        this.lastEdit = [field, text];
+        this.staged.set(field, text);
+      },
       resetField: (field) => this.staged.delete(field),
       save: () => {
         this.saved += 1;
+        for (const [key, value] of this.staged) this.savedValues.set(key, value === "true" ? true : value === "false" ? false : value);
         this.staged.clear();
       },
       discard: () => this.staged.clear(),
@@ -495,5 +498,89 @@ await check("设置卡片：dirty 后保存调用 actions().save()", () => {
     assert.match(text, /被单独覆盖的会话: 2/);
   });
 }
+
+// ---------------------------------------------------------------------------
+// 弹窗补齐：设置轮次 / 稀疏 / 全量 / 全局开关
+// ---------------------------------------------------------------------------
+await check("弹窗：每 N 轮 + 应用 + 稀疏 + 全量，应用发 every:N", async () => {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const rendered = renderDialog();
+  const everyInput = find(rendered, (node) => node.type === "input" && node.props?.["data-role"] === "every-n");
+  assert.ok(everyInput !== undefined, "应有每 N 轮输入框");
+  assert.equal(everyInput.props.value, "3", "默认 3");
+  assert.ok(find(rendered, (node) => node.type === "button" && node.props?.["data-action"] === "sparse") !== undefined, "应有稀疏");
+  assert.ok(find(rendered, (node) => node.type === "button" && node.props?.["data-action"] === "full") !== undefined, "应有全量");
+  const before = commands.length;
+  find(renderDialog(), (node) => node.type === "button" && node.props?.["data-action"] === "apply-every").props.onClick();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const sent = commands.slice(before).filter((call) => call.line.startsWith("/vibe-nudge every:"));
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].line, "/vibe-nudge every:3");
+  assert.equal(sent[0].sessionId, "session-abcdef1234");
+});
+
+await check("弹窗：非法 N（0 / 空 / abc）标红且不发命令", async () => {
+  for (const bad of ["0", "", "abc"]) {
+    const input = find(renderDialog(), (node) => node.type === "input" && node.props?.["data-role"] === "every-n");
+    input.props.onChange({ target: { value: bad } });
+    const before = commands.length;
+    const rendered = renderDialog();
+    const styled = find(rendered, (node) => node.type === "input" && node.props?.["data-role"] === "every-n");
+    assert.equal(styled.props.style.borderColor, "#dc2626", `${JSON.stringify(bad)} 应标红`);
+    const apply = find(rendered, (node) => node.type === "button" && node.props?.["data-action"] === "apply-every");
+    assert.equal(apply.props.disabled, true, "非法值应禁用应用");
+    apply.props.onClick();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(commands.slice(before).filter((call) => call.line.startsWith("/vibe-nudge every:")).length, 0);
+  }
+  find(renderDialog(), (node) => node.type === "input" && node.props?.["data-role"] === "every-n").props.onChange({ target: { value: "3" } });
+});
+
+await check("弹窗：全局开启 + 全局关闭按钮，点击走 SettingsFormModel 的 edit+save", async () => {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const model = models.at(-1);
+  const savedBefore = model.saved;
+  const rendered = renderDialog();
+  const text = textOf(rendered);
+  assert.match(text, /全局：开启/);
+  const offBtn = find(rendered, (node) => node.type === "button" && node.props?.["data-action"] === "global-off");
+  assert.ok(offBtn !== undefined, "应有「全局关闭」按钮");
+  assert.equal(offBtn.props.children, "全局关闭");
+  offBtn.props.onClick();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(model.lastEdit, ["nudgeEnabled", "false"], "应通过表单模型 edit nudgeEnabled");
+  assert.equal(model.saved, savedBefore + 1, "应调用 save()");
+  assert.equal(nudgeFace.nudgeGlobal.value, false, "读回应为关闭");
+});
+
+await check("弹窗：全局关闭时状态行显示“全局已关闭（本会话设置不生效）”", async () => {
+  await nudgeFace.nudgeLoad("session-abcdef1234");
+  const text = textOf(renderDialog());
+  assert.match(text, /生效：全局已关闭（本会话设置不生效）/);
+  assert.match(text, /全局关闭期间不会注入任何碎碎念/, "还要有“不注入”的提示");
+  assert.match(text, /全局：已关闭/);
+  // 复原，别影响后面的面板/卡片用例
+  await nudgeFace.nudgeGlobal.set(true);
+  assert.equal(nudgeFace.nudgeGlobal.value, true);
+});
+
+await check("面板：规则区首行显示全局开关，全局关闭时逐会话行带（全局关闭）", () => {
+  const rows = [
+    { kind: "parent", sessionId: "session-parent-1", mode: "global", custom: false, every: 4, globalOn: true },
+    { kind: "child", sessionId: "child-aaaa-1111", mode: "off", custom: false, every: 4, globalOn: true },
+  ];
+  const onText = textOf(pageEntry.component({ ...pageProps, nudgeRows: rows, nudgeGlobalEvery: 4, nudgeGlobalOn: () => true }));
+  assert.match(onText, /全局：开启（每 4 轮）/);
+  const offText = textOf(
+    pageEntry.component({
+      ...pageProps,
+      nudgeRows: rows.map((row) => ({ ...row, globalOn: false })),
+      nudgeGlobalEvery: 4,
+      nudgeGlobalOn: () => false,
+    }),
+  );
+  assert.match(offText, /全局：已关闭/);
+  assert.match(offText, /子会话 child-aa · 已关闭（全局关闭）/);
+});
 
 console.log(results.join("\n"));

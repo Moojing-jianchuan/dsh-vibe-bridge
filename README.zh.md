@@ -95,6 +95,7 @@ Windows 上依赖联接用的是目录 junction，不需要管理员权限、也
         fromTurn: 1
         skipSubagentSessions: true
         speakOnFirstSeen: true
+        nudgeEnabled: true       # 只关碎碎念的总开关（≠ 整插件 enabled）
         nudgeText: ''            # 空 = 回落 rule.file / 包内 nudge.md
         rules:
           - name: verify
@@ -114,6 +115,7 @@ Windows 上依赖联接用的是目录 junction，不需要管理员权限、也
 | `everyTurns` / `fullEveryTurns` / `fromTurn` | 4 / 12 / 1 | **顶层节奏标量**：规则没写该字段时用它（设置页编辑的正是这些） |
 | `skipSubagentSessions` / `speakOnFirstSeen` | `true` / `true` | 同名字段的顶层默认值 |
 | `nudgeText` | `""` | 全局全量文案；空 = `rule.file` → `rule.text`（无 rules 时再回落包内 `nudge.md`） |
+| `nudgeEnabled` | `true` | **只关碎碎念**的总开关；`false` 时在会话覆盖之前就短路（任何会话都不注入，`full`/`every:1` 也一样） |
 | `wakeDebounceMs` | 800 | 完成通知的合并窗口 |
 | `persistWakeState` | `true` | 写 `wake-state.json` 并在启动时补偿 |
 | `enableSpawn` / `enableQuery` / `enablePost` / `enableList` / `enableStop` | `true` | 逐工具开关 |
@@ -149,15 +151,17 @@ Windows 上依赖联接用的是目录 junction，不需要管理员权限、也
 2. **父对话及其子对话**（只读）：`父对话 <id8> · <标题>`，其下缩进每个子会话 `子会话 <id8> · <label> · <任务描述，截断 40 字>`；数据来自 `listSessions()` 与 `subagentCatalog` 投影。原「父会话 id / 任务」调度台表单已删除。
 3. **会话树**：树头放了「创建子会话」（打开的还是那个 `VibeSpawnDialog`，默认父会话取列表里第一个）和「刷新」；每行的 draft 输入 + 发送不变。
 4. **这个插件带来什么**：三张卡片改成一段文字。
-5. **碎碎念规则**：逐会话列出实际生效配置，数据来自**一次** `/vibe-nudge status all` 调用 —— `父对话 a1b2c3d4 · 每 4 轮（全局文案）`、`子会话 e5f6a7b8 · 已关闭`、`子会话 … · 每 3 轮（本会话文案）`。没有覆盖的会话显示全局节奏 + “全局文案”；这里不读也不显示 `cordis.patch.yml`。
+5. **碎碎念规则**：首行 `全局：开启（每 4 轮）` / `全局：已关闭`，其后逐会话列出实际生效配置，数据来自**一次** `/vibe-nudge status all` 调用 —— `父对话 a1b2c3d4 · 每 4 轮（全局文案）`、`子会话 e5f6a7b8 · 已关闭`、`子会话 … · 每 3 轮（本会话文案）`。没有覆盖的会话显示全局节奏 + “全局文案”；全局关闭时每行统一加 `（全局关闭）`，避免误以为是单会话设置坏了；这里不读也不显示 `cordis.patch.yml`。
 
 **右键任一会话 →「碎碎念编辑」**（子会话行同样有）弹出只作用于该对话的弹窗：
 
-- 标题 `碎碎念 · <id8>`，只读状态行（`生效：全局 / 已关闭 / 稀疏 / 全量 / 每 N 轮 · 文案：全局/本会话`）；
+- 标题 `碎碎念 · <id8>`，只读状态行（`生效：全局 / 已关闭 / 稀疏 / 全量 / 每 N 轮 · 文案：全局/本会话`）；全局关闭时显示 `生效：全局已关闭（本会话设置不生效）`；
 - **打开** = `/vibe-nudge on`（回落全局），**关闭** = `/vibe-nudge off`，**编辑** 展开多行输入（预填该会话自定义文案，空 = “使用全局文案”），**保存 / 取消**；保存发 `/vibe-nudge text:<base64>`，留空保存 = 清除自定义文案；
+- **设置轮次**：`每 [N] 轮` + **应用**（发 `/vibe-nudge every:N`，N 必须是 ≥1 的整数，否则输入框标红且不发送），另有 **稀疏**（`sparse`）与 **全量**（`full`）两个快捷按钮；
+- **全局**：`全局：开启/已关闭` + **全局关闭 / 全局开启**。这一项走**设置表单模型**（`edit('nudgeEnabled', …)` + `save()`），与设置卡片同一条通道 —— 客户端从不自己改配置文件；
 - 弹窗里有一行 `仅作用于本次对话；子会话同样适用。`，右上角 ✕，点遮罩或按 Esc 也可关闭。
 
-面板与弹窗的一切改动都走 `ctx.remote.commands.execute(会话, 命令, [])`，客户端自身从不读写 `nudges.json`。
+面板与弹窗的会话级改动走 `ctx.remote.commands.execute(会话, 命令, [])`，全局开关走设置表单模型；客户端自身从不读写 `nudges.json`。
 
 ### 设置卡片
 
@@ -292,7 +296,7 @@ a1f82c62-… [inactive] (top-level) — 重建工作区  ·  D:\ds_work  ·  --D
 三个入口写的是同一个文件，所以重启后依然生效：
 
 - `nudge_control(session_id, mode)`（模型工具）；
-- 宿主命令 `/vibe-nudge …`：`off` | `on` | `sparse` | `full` | `every:N` | `clear`（无参 = 在 `off` ↔ 全局之间切换），`text:<base64>` 设置本会话文案（`text:` 清空），`status` 给单个会话（`every … / rules: … / overrides: …` 外加一行 `session: mode=… text=<base64|empty>` 供弹窗预填），`status all` 给面板（首行 `global: every N · full M · from K`，之后每个有覆盖的会话一行 `<id>: <mode> text=yes|no`）；
+- 宿主命令 `/vibe-nudge …`：`off` | `on` | `sparse` | `full` | `every:N` | `clear`（无参 = 在 `off` ↔ 全局之间切换），`text:<base64>` 设置本会话文案（`text:` 清空），`status` 给单个会话（`every … · global on|off` / `rules: …` / `overrides: …` 外加一行 `session: mode=… text=<base64|empty>` 供弹窗预填），`status all` 给面板（首行 `global: on|off · every N · full M · from K`，之后每个有覆盖的会话一行 `<id>: <mode> text=yes|no`）；
 - 右键「碎碎念编辑」弹窗（见上）。
 
 `nudges.json` 坏掉或读不到时一律当空表处理（只记一次 `warn`，**绝不**让 `agent/pre-step` 抛错），所以手改成坏文件也不会卡住一轮。

@@ -1348,7 +1348,7 @@ const nudgeTextCheck = async () => {
   await checkAsync("C5 status all：固定格式（global 行 + 只列有覆盖的会话）", async () => {
     const all = await command.handler({ agent: { id: "session-t1" }, rawInput: "status all" });
     const lines = all.text.split("\n");
-    assert.equal(lines[0], "global: every 2 · full 4 · from 1");
+    assert.equal(lines[0], "global: on · every 2 · full 4 · from 1");
     assert.ok(lines.includes("session-t1: global text=yes"), all.text);
     assert.ok(lines.includes("session-t3: off text=yes"), all.text);
     assert.ok(!lines.some((line) => line.startsWith("session-t9:")), "没有覆盖的会话不该出现");
@@ -1359,7 +1359,54 @@ const nudgeTextCheck = async () => {
     const fresh = makeCtx(Config(baseConfig));
     const freshCommand = fresh.commands.find((definition) => definition.name === "vibe-nudge");
     const all = await freshCommand.handler({ agent: { id: "session-z" }, rawInput: "status all" });
-    assert.equal(all.text, "global: every 2 · full 4 · from 1");
+    assert.equal(all.text, "global: on · every 2 · full 4 · from 1");
+  });
+
+  // ---- 全局开关（nudgeEnabled）----
+  await checkAsync("C7 nudgeEnabled:false → 任何会话零注入（含 full 覆盖），通知不受影响", async () => {
+    writeFileSync(nudgesPath, JSON.stringify({ "session-g1": { mode: "full", updatedAt: new Date().toISOString() } }), "utf8");
+    const off = makeCtx(Config({ ...baseConfig, nudgeEnabled: false }));
+    const offCommand = off.commands.find((definition) => definition.name === "vibe-nudge");
+    const textAt = async (sessionId, turn) => {
+      const decision = await step(off.preStep[0], { turn, agent: { id: sessionId, session: { id: sessionId } } });
+      return decision.messages
+        .filter((message) => message.source?.kind === name)
+        .map((message) => message.content.map((part) => part.text).join(""))
+        .join("");
+    };
+    assert.equal(await textAt("session-g1", 1), "", "full 覆盖也不该在全局关闭时注入");
+    assert.equal(await textAt("session-g2", 1), "", "普通会话也不注入");
+    // status 首行带 global off
+    const all = await offCommand.handler({ agent: { id: "session-g1" }, rawInput: "status all" });
+    assert.equal(all.text.split("\n")[0], "global: off · every 2 · full 4 · from 1");
+    const single = await offCommand.handler({ agent: { id: "session-g1" }, rawInput: "status" });
+    assert.match(single.text.split("\n")[0], /global off$/);
+  });
+
+  await checkAsync("C8 nudgeEnabled:true + 会话 off：该会话零注入，其它会话正常（两开关不互相干扰）", async () => {
+    writeFileSync(nudgesPath, JSON.stringify({ "session-h1": { mode: "off", updatedAt: new Date().toISOString() } }), "utf8");
+    const on = makeCtx(Config({ ...baseConfig, nudgeEnabled: true }));
+    const textAt = async (sessionId, turn) => {
+      const decision = await step(on.preStep[0], { turn, agent: { id: sessionId, session: { id: sessionId } } });
+      return decision.messages
+        .filter((message) => message.source?.kind === name)
+        .map((message) => message.content.map((part) => part.text).join(""))
+        .join("");
+    };
+    assert.equal(await textAt("session-h1", 1), "", "会话 off 应零注入");
+    assert.match(await textAt("session-h2", 1), /GLOBAL-TEXT/, "其它会话照常注入");
+  });
+
+  await checkAsync("C9 status / status all 首行的 global on|off 前缀（两种状态）", async () => {
+    writeFileSync(nudgesPath, "{}", "utf8");
+    const on = makeCtx(Config({ ...baseConfig, nudgeEnabled: true }));
+    const onCommand = on.commands.find((definition) => definition.name === "vibe-nudge");
+    assert.equal((await onCommand.handler({ agent: { id: "s" }, rawInput: "status all" })).text.split("\n")[0], "global: on · every 2 · full 4 · from 1");
+    assert.match((await onCommand.handler({ agent: { id: "s" }, rawInput: "status" })).text.split("\n")[0], /· global on$/);
+    const off = makeCtx(Config({ ...baseConfig, nudgeEnabled: false }));
+    const offCommand = off.commands.find((definition) => definition.name === "vibe-nudge");
+    assert.equal((await offCommand.handler({ agent: { id: "s" }, rawInput: "status all" })).text.split("\n")[0], "global: off · every 2 · full 4 · from 1");
+    assert.match((await offCommand.handler({ agent: { id: "s" }, rawInput: "status" })).text.split("\n")[0], /· global off$/);
   });
 
   console.log(results.slice(firstNew).join("\n"));
