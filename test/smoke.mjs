@@ -1369,6 +1369,11 @@ const defectCheck = async () => {
     assert.equal(rulesFile["session-c"].length, 1, "clear 不该动规则");
     await control.execute({ session_id: "session-c", mode: "purge" }, {});
     assert.equal(JSON.parse(readFileSync(nudgesPath, "utf8"))["session-c"], undefined);
+    // v0.14 起规则是唯一注入源：purge 必须连规则一起清，否则"清除"名不副实。
+    const rulesAfterPurge = existsSync(path.join(TEST_HOME, "vibe-bridge", "rules.json"))
+      ? JSON.parse(readFileSync(path.join(TEST_HOME, "vibe-bridge", "rules.json"), "utf8"))
+      : {};
+    assert.equal(rulesAfterPurge["session-c"], undefined, "purge 之后该会话的规则必须消失");
   });
 
 

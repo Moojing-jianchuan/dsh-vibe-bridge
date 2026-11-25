@@ -644,4 +644,12 @@ await check("F1 点某一条 → 表单被填进该条内容（内容框 value +
   assert.equal(find(rendered, (node) => node.props?.["data-strategy"] === "first-message").props["aria-pressed"], true, "策略应预选该条的");
 });
 
+await check("按钮文案：暂停注入 vs 彻底删除（含规则与文案）", () => {
+  const text = textOf(renderDialog());
+  // 用户真实误操作：以为「清除」只是关掉，结果 nudges 被清、规则还在继续注入。
+  assert.match(text, /暂停注入/);
+  assert.match(text, /彻底删除（含规则与文案）/);
+  assert.doesNotMatch(text, /清除/);
+});
+
 console.log(results.join("\n"));
