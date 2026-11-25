@@ -138,7 +138,7 @@ Windows 上依赖联接用的是目录 junction，不需要管理员权限、也
 | `query_session(session_id, tail?, include_tools?, verbose?)` | 头部信息 + 最近 `tail` 轮；新增 `[inject]` 段显示别的会话注入的消息；`verbose` 才给模型/供应商/工作目录与更长的正文 |
 | `get_session_inbox(session_id)` | 别的会话还没被消费的队列：`{position, target, source_kind, sender_session_id?, queued_at, preview}` |
 | `stop_session(session_id)` | 只停自己的直接子会话 |
-| `nudge_control(session_id, mode, text?)` | 按会话开关碎碎念：`off` / `sparse` / `full` / `every:N` / `clear`（`on` = clear）/ `purge`；`clear` **只清节奏**、保留本会话文案，`purge` 整条删除；可选 `text` 一次写入本会话文案（`""` = 清空）；返回 `{session_id, mode, source: 'session' \| 'global'}`，重启后仍生效 |
+| `nudge_control(session_id, mode, rules?, text?)` | 按会话开关碎碎念：`off` / `on`（= `clear`）/ `clear` / `purge`，另有可选 `rules` 数组（整体替换本会话规则）与 `text` 兼容别名（写/覆盖**第一条**规则正文）；`clear` 只清 mode，`purge` 整条删除；返回 `{session_id, mode, source, rulesCount}` |
 | `vibe_bridge_status()` | 在线状态、规则列表、已注入次数**与字符数**，外加 `overridesCount` 与最多五条 `{sessionId, mode, textCustom, textPreview}`（只有自定义文案的会话，`mode` 报 `global`） |
 
 宿主命令 `/vibe-spawn <名字>|<任务>` 就是界面里「创建子会话」背后的那条路径 —— 所以建子会话不消耗父会话的任何模型轮次。
@@ -273,7 +273,53 @@ a1f82c62-… [inactive] (top-level) — 重建工作区  ·  D:\ds_work  ·  --D
 `status` 在 Agent 仍注册于 `ctx.agents` 时是 `running` / `inactive`，否则是 `not-loaded`（重启后、或属于别的进程）—— 这描述的是注册表事实，不是会话本身状态。
 自己所在 workspace 的行排在最前，其次新的在前。要拿「不是自己子会话」的 id 去跨父投递，就用这个列表查。
 
-### 6. 按会话注入（`nudges.json`）
+### 6. 按会话规则（`rules.json`）与旧的 `nudges.json`
+
+每个会话可以有自己的**规则列表**，存在 `$DSH_HOME/vibe-bridge/rules.json`（与 `nudges.json` 并存）：
+
+```jsonc
+{
+  "<sessionId>": [
+    { "id": "r-1a2b3c", "type": "rule", "content": "规则正文（≤4000 字）",
+      "strategies": ["every-n"], "everyN": 3, "enabled": true,
+      "createdAt": "…", "updatedAt": "…" }
+  ]
+}
+```
+
+优先级：`nudgeEnabled=false`（插件配置）→ `nudges.json mode:"off"` → **本会话规则** → 旧的全局 `rules[]`。
+会话有至少一条 enabled 规则时**只用它**（不再叠加全局规则）；每轮命中合并成**一段**：
+
+```
+[SYSTEM REMINDER:nudge]
+(约束) 不要用 print 调试
+(偏好) 回答先说结论
+[/SYSTEM REMINDER]
+```
+
+策略：`every-message` 每轮、`every-n` 第 1、1+N、1+2N… 轮、`first-message` 每会话只一次（进程标记 + 会话日志双判据，
+重启不重复）。若同一条规则这轮要发的正文与上次完全相同，只发那句通用短句（`按「…」的规则自检一遍（内容同上一轮，未重复）。`），
+不会每轮重发 194 字全文。
+
+**向后兼容（只读）**：`nudges.json` 里带 `text` 的旧条目在运行时被当成一条**虚拟规则**，**不写任何文件**——
+`mode: every:N` → `every-n`+N，`full` → `every-message`，其余（无 mode / `sparse`）→ `every-n`+配置的 `everyTurns`；
+`mode:"off"` 仍然整会话短路。`apply` 绝不改写 `nudges.json` / `rules.json`，两个文件只在调用命令时才变。
+有真实规则时虚拟规则不参与，`vibe_bridge_status` 的 `rulesCount` 也不把它算进去。
+
+命令（客户端只走这些，从不自己改文件）：
+
+| 命令 | 作用 |
+|---|---|
+| `/vibe-nudge rules` | 返回该会话规则数组的 `base64(JSON)` |
+| `/vibe-nudge rules:<base64>` | 整体替换（整体校验：type 枚举、content ≤4000、strategies ⊆ 三值、`everyN` ≥1 整数、id 唯一）；非法整体拒绝、不写盘 |
+| `/vibe-nudge off` / `on` / `clear` | 会话主开关（`on` = `clear`；无参 = off ↔ clear 切换） |
+| `/vibe-nudge purge` | 删掉该会话在 `nudges.json` 的条目 |
+| `/vibe-nudge text:<base64>` | **兼容别名**：写/覆盖**第一条**规则的正文（没有就建一条 `every-message`）；`text:` 清空那一条 |
+| `/vibe-nudge status` / `status all` | 只读摘要（首行 `… · global on|off`、`session:` 行、`tip:` 行） |
+
+已移除（返回 `已移除：会话级节奏改由规则策略表达，请用 /vibe-nudge rules:<base64>；off/on/clear/purge 仍可用。`）：
+`/vibe-nudge every:N`、`/vibe-nudge sparse`、`/vibe-nudge full`。
+
 
 节奏是全局的；单个会话可以单独关掉、换节奏，**或者带一份自己的文案**，都不用改配置：
 
@@ -309,6 +355,32 @@ a1f82c62-… [inactive] (top-level) — 重建工作区  ·  D:\ds_work  ·  --D
 弹窗的「打开」就是 `on`（= clear），所以关一次再开回来不会丢文案。
 
 `nudges.json` 坏掉或读不到时一律当空表处理（只记一次 `warn`，**绝不**让 `agent/pre-step` 抛错），所以手改成坏文件也不会卡住一轮。
+
+### 7. 每个会话的规则（`rules.json`）
+
+每个会话在 `$DSH_HOME/vibe-bridge/rules.json` 里各存一套规则：
+
+```json
+{
+  "<sessionId>": [
+    {
+      "id": "r-1a2b3c",
+      "type": "rule | constraint | preference | convention | feedback",
+      "content": "不要用 print 调试",
+      "strategies": ["every-message" | "every-n" | "first-message"],
+      "everyN": 3,
+      "enabled": true
+    }
+  ]
+}
+```
+
+- **注入策略**取代了旧的会话级节奏：`every-message`（每轮）、`every-n`（每 N 轮，`everyN ≥ 1`）、`first-message`（只一次，记标记，重启不重复）。同一轮命中多条规则会**合并成一段**，按类型打标签、按数组顺序输出。
+- **优先级**：`nudgeEnabled`（全局开关）→ `nudges.json` 的 `mode:"off"` → 本会话启用的规则 → `cordis.patch.yml` 里的全局规则。**没有规则的会话行为与改造前完全一致。**
+- **校验是整体拒绝**：`type` 五值、`content` 非空且 ≤4000、`strategies` 是三者非空子集、`everyN` 为 ≥1 整数、`id` 唯一；一条不合法就整体不写盘。
+- **失败不静默**：文件损坏或某会话字段非法时，该会话回落全局规则，`vibe_bridge_status` 用 `rulesError` 报原因（正常为 `""`，异常为 `parse failed: …` / `invalid rules: …`）。
+- **一次性自动迁移**：仍带旧 `text` 的会话会被建成一条规则，并**保持原节奏**（`mode: every:N` → `every-n N`；`mode: full` → `every-message`；其余 → `every-n` 并取配置的 `everyTurns`），随后删掉 `text`；写盘先写 rules 再写 nudges，失败两边都不动。再跑一次不产生变化，**已有规则的会话不会被覆盖**。
+- **已移除**（改由规则策略表达）：`/vibe-nudge every:N | sparse | full | text:<base64>` 及对应的 `nudge_control` 参数，调用会得到「已移除」提示且不写盘；`off | on | clear | purge | status | status all` 与新增的 `rules` / `rules:<base64>` 保留。
 
 ## 上下文成本（实测）
 

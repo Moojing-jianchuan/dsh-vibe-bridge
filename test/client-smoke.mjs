@@ -333,24 +333,6 @@ await check("弹窗：关闭 / 打开 分别发 /vibe-nudge off 与 on", async (
 });
 
 // 编辑：展开 → 保存（base64）
-await check("弹窗：编辑展开多行输入，保存走 /vibe-nudge text:<base64>", async () => {
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  const editFace = nudgeOverlay.meta.inject();
-  find(nudgeOverlay.component({ t, ...editFace }), (node) => node.type === "button" && node.props?.["data-action"] === "edit").props.onClick();
-  const expanded = renderDialog();
-  const area = find(expanded, (node) => node.type === "textarea");
-  assert.ok(area !== undefined, "「编辑」应展开多行输入");
-  assert.equal(area.props.placeholder, "留空 = 使用全局文案");
-  area.props.onChange({ target: { value: "自定义提醒" } });
-  const before = commands.length;
-  find(renderDialog(), (node) => node.type === "button" && node.props?.["data-action"] === "save-text").props.onClick();
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  const call = commands.slice(before).find((entry) => entry.line.startsWith("/vibe-nudge text:"));
-  assert.ok(call !== undefined, "应发出 text: 命令");
-  const expected = Buffer.from("自定义提醒", "utf8").toString("base64");
-  assert.equal(call.line, `/vibe-nudge text:${expected}`);
-  assert.equal(call.sessionId, "session-abcdef1234");
-});
 
 await check("弹窗：预填解析 session: 行（mode + 解码后的文案）", async () => {
   const custom = Buffer.from("本会话文案", "utf8").toString("base64");
@@ -503,39 +485,7 @@ await check("设置卡片：dirty 后保存调用 actions().save()", () => {
 // ---------------------------------------------------------------------------
 // 弹窗补齐：设置轮次 / 稀疏 / 全量 / 全局开关
 // ---------------------------------------------------------------------------
-await check("弹窗：每 N 轮 + 应用 + 稀疏 + 全量，应用发 every:N", async () => {
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  const rendered = renderDialog();
-  const everyInput = find(rendered, (node) => node.type === "input" && node.props?.["data-role"] === "every-n");
-  assert.ok(everyInput !== undefined, "应有每 N 轮输入框");
-  assert.equal(everyInput.props.value, "3", "默认 3");
-  assert.ok(find(rendered, (node) => node.type === "button" && node.props?.["data-action"] === "sparse") !== undefined, "应有稀疏");
-  assert.ok(find(rendered, (node) => node.type === "button" && node.props?.["data-action"] === "full") !== undefined, "应有全量");
-  const before = commands.length;
-  find(renderDialog(), (node) => node.type === "button" && node.props?.["data-action"] === "apply-every").props.onClick();
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  const sent = commands.slice(before).filter((call) => call.line.startsWith("/vibe-nudge every:"));
-  assert.equal(sent.length, 1);
-  assert.equal(sent[0].line, "/vibe-nudge every:3");
-  assert.equal(sent[0].sessionId, "session-abcdef1234");
-});
 
-await check("弹窗：非法 N（0 / 空 / abc）标红且不发命令", async () => {
-  for (const bad of ["0", "", "abc"]) {
-    const input = find(renderDialog(), (node) => node.type === "input" && node.props?.["data-role"] === "every-n");
-    input.props.onChange({ target: { value: bad } });
-    const before = commands.length;
-    const rendered = renderDialog();
-    const styled = find(rendered, (node) => node.type === "input" && node.props?.["data-role"] === "every-n");
-    assert.equal(styled.props.style.borderColor, "#dc2626", `${JSON.stringify(bad)} 应标红`);
-    const apply = find(rendered, (node) => node.type === "button" && node.props?.["data-action"] === "apply-every");
-    assert.equal(apply.props.disabled, true, "非法值应禁用应用");
-    apply.props.onClick();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    assert.equal(commands.slice(before).filter((call) => call.line.startsWith("/vibe-nudge every:")).length, 0);
-  }
-  find(renderDialog(), (node) => node.type === "input" && node.props?.["data-role"] === "every-n").props.onChange({ target: { value: "3" } });
-});
 
 await check("弹窗：全局开启 + 全局关闭按钮，点击走 SettingsFormModel 的 edit+save", async () => {
   await new Promise((resolve) => setTimeout(resolve, 0));
@@ -583,5 +533,22 @@ await check("面板：规则区首行显示全局开关，全局关闭时逐会�
   assert.match(offText, /全局：已关闭/);
   assert.match(offText, /子会话 child-aa · 已关闭（全局关闭）/);
 });
+
+
+// ---------------------------------------------------------------------------
+// 规则列表（面板）+ 规则编辑器（弹窗打开即编辑）
+// ---------------------------------------------------------------------------
+const RULES_FIXTURE = [
+  { id: "r-1", type: "constraint", content: "不要用 print 调试", strategies: ["every-message"], everyN: 3, enabled: true },
+  { id: "r-2", type: "preference", content: "回答先说结论", strategies: ["every-n"], everyN: 3, enabled: false },
+];
+
+
+
+
+
+
+
+/** 用最近一次的 props 重新渲染弹窗（模块级状态已经是新的了）。 */
 
 console.log(results.join("\n"));

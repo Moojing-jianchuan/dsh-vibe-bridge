@@ -137,7 +137,7 @@ Priority for every cadence field is **rule field > top-level scalar > built-in d
 | `query_session(session_id, tail?, include_tools?, verbose?)` | header + the last `tail` rounds, including an `[inject]` section for messages other sessions injected; `verbose` adds model/provider/workdir and longer excerpts |
 | `get_session_inbox(session_id)` | what is still queued in another session's inbox: `{position, target, source_kind, sender_session_id?, queued_at, preview}` |
 | `stop_session(session_id)` | interrupts a direct child only |
-| `nudge_control(session_id, mode, text?)` | per-session nudge switch: `off` / `sparse` / `full` / `every:N` / `clear` (or `on` = clear) / `purge`; `clear` drops only the **mode** and keeps this session's custom text, `purge` removes the whole entry; the optional `text` writes the custom text in the same call (`""` clears it); returns `{session_id, mode, source: 'session' \| 'global'}` and survives restarts |
+| `nudge_control(session_id, mode, rules?, text?)` | per-session nudge switch: `off` / `on` (alias of `clear`) / `clear` / `purge`, plus the optional `rules` array (replaces this session's rule list) and the `text` compatibility alias (writes/overwrites the **first** rule's content). `clear` only drops the mode, `purge` removes the whole entry. Returns `{session_id, mode, source, rulesCount}` |
 | `vibe_bridge_status()` | live status, rule list, injected count **and injected characters**, plus `overridesCount` and up to five entries `{sessionId, mode, textCustom, textPreview}` (`mode` is reported as `global` when a session only carries custom text) |
 
 The host command `/vibe-spawn <label>|<task>` backs the UI's *Create child session* action, so creating a child never costs a parent model turn.
@@ -335,7 +335,62 @@ a1f82c62-… [inactive] (top-level) — 重建工作区  ·  D:\ds_work  ·  --D
 Rows from your own workspace come first, then newest first. This is also how you discover an id to use with
 `post_to_session({ cross_parent: true })`.
 
-### 6. Per-session nudges (`nudges.json`)
+### 6. Per-session rules (`rules.json`) and the legacy `nudges.json`
+
+Each session can carry its **own rule list** in `$DSH_HOME/vibe-bridge/rules.json` (kept next to `nudges.json`):
+
+```jsonc
+{
+  "<sessionId>": [
+    {
+      "id": "r-1a2b3c",
+      "type": "rule",              // rule | constraint | preference | convention | feedback
+      "content": "规则正文（≤4000 字）",
+      "strategies": ["every-n"],   // every-message | every-n | first-message (single-select in the UI)
+      "everyN": 3,
+      "enabled": true,
+      "createdAt": "…", "updatedAt": "…"
+    }
+  ]
+}
+```
+
+Priority: `nudgeEnabled=false` (plugin config) → `nudges.json mode:"off"` → **this session's rules** → the old global
+`rules[]` path. When a session has at least one enabled rule, only that list is injected (the global rules are not
+added on top). Every hit is merged into **one** block per turn:
+
+```
+[SYSTEM REMINDER:nudge]
+(约束) 不要用 print 调试
+(偏好) 回答先说结论
+[/SYSTEM REMINDER]
+```
+
+Strategies: `every-message` = every turn, `every-n` = turns 1, 1+N, 1+2N…, `first-message` = once per session
+(judged by the process marker plus the session log, so a restart does not repeat it). If the same rule would send the
+same text as last time, only the generic one-liner is sent (`按「…」的规则自检一遍（内容同上一轮，未重复）。`), so the
+194-character reminder is not re-sent every turn.
+
+**Backward compatibility (read-only).** A legacy `nudges.json` entry with `text` is interpreted at runtime as a
+**virtual rule** and is never written anywhere: `mode: every:N` → `every-n`+N, `full` → `every-message`, anything
+else (no mode / `sparse`) → `every-n`+the configured `everyTurns`; `mode: "off"` still short-circuits the whole
+session. `apply` never writes `nudges.json` or `rules.json` — the two files only change when you call a command.
+A real rule list always wins over the virtual rule, and `rulesCount` in `vibe_bridge_status` does not count it.
+
+Commands (the client only talks to these; it never edits the files itself):
+
+| Command | Effect |
+|---|---|
+| `/vibe-nudge rules` | returns the session's rule array as `base64(JSON)` |
+| `/vibe-nudge rules:<base64>` | replaces the whole array (validated as a whole: type enum, content ≤4000, strategies ⊆ three values, `everyN` ≥1 integer, unique ids); an invalid payload is rejected and nothing is written |
+| `/vibe-nudge off` / `on` / `clear` | master switch for the session (`on` = `clear`; no argument toggles off ↔ clear) |
+| `/vibe-nudge purge` | removes the session's `nudges.json` entry entirely |
+| `/vibe-nudge text:<base64>` | **compatibility alias**: writes/overwrites the FIRST rule's content (creates an `every-message` rule when there is none); `text:` clears that first rule |
+| `/vibe-nudge status` / `status all` | read-only summaries (first line `… · global on|off`, `session:` line, `tip:` line) |
+
+Removed (they now return `已移除：会话级节奏改由规则策略表达，请用 /vibe-nudge rules:<base64>；off/on/clear/purge 仍可用。`):
+`/vibe-nudge every:N`, `/vibe-nudge sparse`, `/vibe-nudge full`.
+
 
 The cadence is global; a single session can opt out, get a different rhythm, **or carry its own text** without
 touching the configuration:
@@ -384,6 +439,50 @@ notices keep working.
 
 A broken or unreadable `nudges.json` is treated as an empty table (one `warn` in the log, never an exception inside
 `agent/pre-step`), so a hand-edited file cannot wedge a turn.
+
+### 7. Per-session rules (`rules.json`)
+
+Each session keeps its own rule list in `$DSH_HOME/vibe-bridge/rules.json`:
+
+```json
+{
+  "<sessionId>": [
+    {
+      "id": "r-1a2b3c",
+      "type": "rule | constraint | preference | convention | feedback",
+      "content": "never debug with print",
+      "strategies": ["every-message" | "every-n" | "first-message"],
+      "everyN": 3,
+      "enabled": true
+    }
+  ]
+}
+```
+
+- **Strategies** replace the old per-session cadence: `every-message` (each turn), `every-n` (every N turns,
+  `everyN` ≥ 1) and `first-message` (once, recorded so a restart does not repeat it). Several rules that fire on the
+  same turn are merged into **one** block, tagged by type, in array order.
+- **Precedence**: `nudgeEnabled` (global switch) → `nudges.json` `mode: "off"` → this session's enabled rules →
+  the plugin's global rules from `cordis.patch.yml`. A session with no rules behaves exactly as before.
+- **Validation is all-or-nothing**: `type` must be one of the five values, `content` non-empty and ≤ 4000 chars,
+  `strategies` a non-empty subset of the three, `everyN` an integer ≥ 1, `id` unique. One bad entry rejects the whole
+  write and leaves the file untouched.
+- **Failure is never silent**: a corrupt file or an invalid session entry falls back to the global rules for that
+  session, and `vibe_bridge_status` reports `rulesError` (`""` when healthy, `parse failed: …` /
+  `invalid rules: …` otherwise).
+- The dialog (right-click → **碎碎念编辑**) opens straight into the rule editor: type pills, content with a
+  `/4000` counter, a **single** strategy choice, cancel/save. The panel's 碎碎念规则 section lists the rules of the
+  session you are looking at (power / pencil / trash, `从模板添加`, `+ 新建`); the pencil reopens the same editor.
+
+**Migrated once, automatically.** A session that still carries the old `nudges.json` `text` gets a rule built from
+it — cadence preserved (`mode: every:N` → `every-n N`, `mode: full` → `every-message`, everything else →
+`every-n` with the config's `everyTurns`) — then the `text` field is removed and a flush is written rules-first so a
+failure can never lose the copy. Running it twice changes nothing, and a session that already has rules is never
+overwritten.
+
+**Removed in favour of rules**: `/vibe-nudge every:N | sparse | full | text:<base64>` (and the matching
+`nudge_control` parameters) now answer with an "已移除" hint instead of writing. `off | on | clear | purge | status |
+status all` and the new `rules` / `rules:<base64>` remain.
 
 ## What it costs in context
 

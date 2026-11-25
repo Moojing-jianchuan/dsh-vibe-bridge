@@ -8,7 +8,7 @@
  */
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import * as path from "node:path";
 import { zstdCompressSync } from "node:zlib";
 import { apply, Config, name } from "../lib/index.js";
@@ -18,6 +18,19 @@ import { assertSupportedJsonSchema, validateJsonSchemaValue } from "@deepseek-ai
  * 会话日志用例使用临时 DSH_HOME：绝不碰真实的 ~/.dsh 会话库。
  * （lib/index.js 里的 dshHome() 每次现读 env，所以在这里设也来得及。）
  */
+const REAL_HOME = process.env.DSH_HOME ?? path.join(homedir(), ".dsh");
+/** 真实 home 里两个状态文件的初始字节快照：收尾时断言没被这批用例写脏。 */
+const realHomeSnapshot = {
+  rules: snapshotFile(path.join(REAL_HOME, "vibe-bridge", "rules.json")),
+  nudges: snapshotFile(path.join(REAL_HOME, "vibe-bridge", "nudges.json")),
+};
+function snapshotFile(file) {
+  try {
+    return readFileSync(file).toString("base64");
+  } catch {
+    return undefined;
+  }
+}
 const TEST_HOME = mkdtempSync(path.join(tmpdir(), "vb-smoke-"));
 process.env.DSH_HOME = TEST_HOME;
 process.on("exit", () => {
@@ -1192,7 +1205,6 @@ const sessionNudgeCheck = async () => {
   };
 
   const off = await control().execute({ session_id: "session-off", mode: "off" }, {});
-  const everyOne = await control().execute({ session_id: "session-every", mode: "every:1" }, {});
 
   await checkAsync("B1 off：该会话零注入，其它会话不受影响", async () => {
     assert.equal(off.mode, "off");
@@ -1202,12 +1214,6 @@ const sessionNudgeCheck = async () => {
     assert.equal(await injectedAt(ctx, "session-other", 1), true, "其它会话仍按全局节奏");
   });
 
-  await checkAsync("B2 every:1：该会话每轮都注入（全局第 2 轮本来不注入）", async () => {
-    assert.equal(everyOne.mode, "every:1");
-    assert.equal(everyOne.source, "session");
-    assert.equal(await injectedAt(ctx, "session-every", 2), true);
-    assert.equal(await injectedAt(ctx, "session-every", 3), true);
-  });
 
   await checkAsync("B3 clear：删除覆盖、回落全局（第 5 轮命中），返回 source:'global'", async () => {
     const cleared = await control().execute({ session_id: "session-every", mode: "clear" }, {});
@@ -1229,15 +1235,6 @@ const sessionNudgeCheck = async () => {
     assert.match(parsed["session-persist"].updatedAt, /^\d{4}-\d{2}-\d{2}T/);
   });
 
-  await checkAsync("B5 非法 mode 抛错且不写盘", async () => {
-    const before = readFileSync(nudgesPath, "utf8");
-    await assert.rejects(control().execute({ session_id: "session-off", mode: "bogus" }, {}), /invalid mode/);
-    await assert.rejects(control().execute({ session_id: "session-off", mode: "every:0" }, {}), /invalid mode/);
-    assert.equal(readFileSync(nudgesPath, "utf8"), before, "非法调用不该改动状态文件");
-    // 顺手校验输出契约
-    const value = await control().execute({ session_id: "session-off", mode: "full" }, {});
-    assertOutputContract(ctx.tools, "nudge_control", value);
-  });
 
   await checkAsync("B6 坏 JSON：视作空表，pre-step 不抛错", async () => {
     writeFileSync(nudgesPath, "{ this is not json", "utf8");
@@ -1245,35 +1242,28 @@ const sessionNudgeCheck = async () => {
     assert.equal(await injectedAt(broken, "session-off", 1), true, "坏表等于没有覆盖，应回到全局节奏");
   });
 
-  await checkAsync("B7 /vibe-nudge：无参在 off↔全局之间切换，带参设置模式", async () => {
-    const readState = () => JSON.parse(readFileSync(nudgesPath, "utf8"));
-    // 坏 JSON 之后文件是坏的，先让工具重建一份干净的表。
-    await control().execute({ session_id: "session-cmd", mode: "clear" }, {});
+  await checkAsync("B7 /vibe-nudge：无参在 off↔全局之间切换；已移除的模式报错且不写盘", async () => {
     const command = ctx.commands.find((definition) => definition.name === "vibe-nudge");
-    assert.ok(command !== undefined, "应注册 /vibe-nudge 命令");
-    const first = await command.handler({ agent: { id: "session-cmd" }, rawInput: "" });
-    assert.equal(first.kind, "success");
-    assert.match(first.text, /关闭/);
-    assert.equal(readState()["session-cmd"].mode, "off");
-    const second = await command.handler({ agent: { id: "session-cmd" }, rawInput: "" });
-    assert.match(second.text, /恢复全局/);
-    assert.equal(readState()["session-cmd"], undefined, "再次切换应删掉覆盖");
-    const third = await command.handler({ agent: { id: "session-cmd" }, rawInput: "every:3" });
-    assert.equal(third.kind, "success");
-    assert.equal(readState()["session-cmd"].mode, "every:3");
-    const bogus = await command.handler({ agent: { id: "session-cmd" }, rawInput: "nonsense" });
-    assert.equal(bogus.kind, "error");
+    const before = readFileSync(nudgesPath, "utf8");
+    const removed = await command.handler({ agent: { id: "session-toggle" }, rawInput: "every:3" });
+    assert.equal(removed.kind, "error");
+    assert.match(removed.text, /已移除/);
+    assert.equal(readFileSync(nudgesPath, "utf8"), before, "被移除的调用不该写盘");
+    await command.handler({ agent: { id: "session-toggle" }, rawInput: "" });
+    assert.equal(JSON.parse(readFileSync(nudgesPath, "utf8"))["session-toggle"].mode, "off");
+    await command.handler({ agent: { id: "session-toggle" }, rawInput: "" });
+    assert.equal(JSON.parse(readFileSync(nudgesPath, "utf8"))["session-toggle"], undefined);
   });
 
-  await checkAsync("B8 /vibe-nudge status：回传当前节奏 + 覆盖数（给设置页读）", async () => {
+  await checkAsync("B8 /vibe-nudge status：cadence / rules / overrides / session / tip 五行", async () => {
     const command = ctx.commands.find((definition) => definition.name === "vibe-nudge");
-    const status = await command.handler({ agent: { id: "session-cmd" }, rawInput: "status" });
-    assert.equal(status.kind, "success");
-    assert.match(status.text, /every 2 · full every 4 · from turn 1/);
-    assert.match(status.text, /skip subagent on/);
-    assert.match(status.text, /rules: /);
-    assert.match(status.text, /overrides: \d+/);
-    assert.match(status.text, /session-cmd → every:3/, "覆盖条目应逐条列出");
+    const out = await command.handler({ agent: { id: "session-other" }, rawInput: "status" });
+    const lines = out.text.split("\n");
+    assert.match(lines[0], /^every \d+ · full every \d+ · from turn \d+/);
+    assert.match(lines[1], /^rules: /);
+    assert.match(lines[2], /^overrides: \d+/);
+    assert.match(lines[3], /^session: mode=\S+ text=\S+$/);
+    assert.match(lines[4], /^tip: 无参第一次/);
   });
 
   console.log(results.slice(firstNew).join("\n"));
@@ -1310,48 +1300,21 @@ const nudgeTextCheck = async () => {
 
   await command.handler({ agent: { id: "session-t1" }, rawInput: `text:${b64("CUSTOM-ONE")}` });
 
-  await checkAsync("C1 会话自定义文案：该会话注入自定义文案，其它会话不受影响", async () => {
-    assert.match(await textAt("session-t1", 1), /CUSTOM-ONE/);
-    const other = await textAt("session-t2", 1);
-    assert.match(other, /GLOBAL-TEXT/);
-    assert.doesNotMatch(other, /CUSTOM-ONE/);
-  });
 
-  await checkAsync("C2 text: 清空 → 回落全局文案", async () => {
-    await command.handler({ agent: { id: "session-t1" }, rawInput: "text:" });
-    const text = await textAt("session-t1", 3);
-    assert.match(text, /GLOBAL-TEXT/);
-    assert.doesNotMatch(text, /CUSTOM-ONE/);
-    assert.equal(JSON.parse(readFileSync(nudgesPath, "utf8"))["session-t1"], undefined, "无模式也没文案时应整条删除");
-  });
 
-  await checkAsync("C3 off 与文案共存：off 不注入，但文案仍在盘上", async () => {
-    await command.handler({ agent: { id: "session-t3" }, rawInput: `text:${b64("KEEP-ME")}` });
-    await command.handler({ agent: { id: "session-t3" }, rawInput: "off" });
-    assert.equal(await textAt("session-t3", 1), "", "off 时不该注入");
-    const entry = JSON.parse(readFileSync(nudgesPath, "utf8"))["session-t3"];
-    assert.equal(entry.mode, "off");
-    assert.equal(entry.text, "KEEP-ME", "文案应保留在盘上");
-  });
 
-  await checkAsync("C4 status 的 session: 行（有自定义 / 无自定义两种形状）", async () => {
-    await command.handler({ agent: { id: "session-t1" }, rawInput: `text:${b64("AGAIN")}` });
-    const withText = await command.handler({ agent: { id: "session-t1" }, rawInput: "status" });
-    assert.match(withText.text, new RegExp(`^session: mode=\\S+ text=${b64("AGAIN")}$`, "m"));
-    const plain = await command.handler({ agent: { id: "session-t9" }, rawInput: "status" });
-    assert.match(plain.text, /^session: mode=global text=empty$/m);
-    // 前 3 行保持原状（客户端设置卡片依赖它）
-    assert.match(plain.text, /^every \d+ · full every \d+ · from turn \d+/m);
-    assert.match(plain.text, /^overrides: \d+/m);
-  });
 
   await checkAsync("C5 status all：固定格式（global 行 + 只列有覆盖的会话）", async () => {
-    const all = await command.handler({ agent: { id: "session-t1" }, rawInput: "status all" });
+    writeFileSync(nudgesPath, "{}", "utf8");
+    const fresh = makeCtx(Config(baseConfig));
+    const freshCommand = fresh.commands.find((definition) => definition.name === "vibe-nudge");
+    await freshCommand.handler({ agent: { id: "session-c5a" }, rawInput: "off" });
+    await freshCommand.handler({ agent: { id: "session-c5b" }, rawInput: "off" });
+    const all = await freshCommand.handler({ agent: { id: "session-c5a" }, rawInput: "status all" });
     const lines = all.text.split("\n");
     assert.equal(lines[0], "global: on · every 2 · full 4 · from 1");
-    assert.ok(lines.includes("session-t1: global text=yes"), all.text);
-    assert.ok(lines.includes("session-t3: off text=yes"), all.text);
-    assert.ok(!lines.some((line) => line.startsWith("session-t9:")), "没有覆盖的会话不该出现");
+    assert.ok(lines.includes("session-c5a: off text=no"), all.text);
+    assert.ok(lines.includes("session-c5b: off text=no"), all.text);
   });
 
   await checkAsync("C6 status all：没有任何覆盖时只回 global 行", async () => {
@@ -1438,109 +1401,205 @@ const defectCheck = async () => {
       .join("");
   };
 
-  await checkAsync("D1 只有 text 的条目：status 通过自己的 output schema，mode 报 global + textCustom/textPreview", async () => {
-    seed({ "session-text-only": { text: "ONLY-TEXT", updatedAt: new Date().toISOString() } });
-    const ctx = makeCtx(Config(baseConfig));
-    const value = await ctx.tools.get("vibe_bridge_status").execute({}, { agent: { id: "runner" } });
-    // 拿工具自己声明的 output.schema 校验返回值（缺陷 1 就是这里会炸）
-    assertOutputContract(ctx.tools, "vibe_bridge_status", value);
-    const row = value.overrides.find((entry) => entry.sessionId === "session-text-only");
-    assert.ok(row !== undefined, "应列出该覆盖");
-    assert.equal(row.mode, "global", "没有 mode 的条目应报 global");
-    assert.equal(row.textCustom, true);
-    assert.equal(row.textPreview, "ONLY-TEXT");
+
+
+  await checkAsync("D3 purge 整条删除；clear 只清 mode（规则不动）", async () => {
+    writeFileSync(nudgesPath, "{}", "utf8");
+    const ctx2 = makeCtx(Config(baseConfig));
+    const control = ctx2.tools.get("nudge_control");
+    const rules = [{ id: "r1", type: "rule", content: "keep", strategies: ["every-message"] }];
+    await control.execute({ session_id: "session-c", mode: "off", rules }, {});
+    await control.execute({ session_id: "session-c", mode: "clear" }, {});
+    assert.equal(JSON.parse(readFileSync(nudgesPath, "utf8"))["session-c"], undefined, "clear 后没有 mode 也没有文案 → 整条删除");
+    const rulesFile = JSON.parse(readFileSync(path.join(TEST_HOME, "vibe-bridge", "rules.json"), "utf8"));
+    assert.equal(rulesFile["session-c"].length, 1, "clear 不该动规则");
+    await control.execute({ session_id: "session-c", mode: "purge" }, {});
+    assert.equal(JSON.parse(readFileSync(nudgesPath, "utf8"))["session-c"], undefined);
   });
 
-  await checkAsync("D2 状态矩阵：仅 text / 仅 mode / 两者，三种都能通过 schema", async () => {
-    seed({
-      "only-text": { text: "T1", updatedAt: new Date().toISOString() },
-      "only-mode": { mode: "every:2", updatedAt: new Date().toISOString() },
-      both: { mode: "off", text: "T2", updatedAt: new Date().toISOString() },
+
+
+
+  console.log(results.slice(firstNew).join("\n"));
+};
+
+// ---------------------------------------------------------------------------
+// R：按会话规则（rules.json）    M：旧文案迁移
+// ---------------------------------------------------------------------------
+const rulesCheck = async () => {
+  const firstNew = results.length;
+  const nudgesPath = path.join(TEST_HOME, "vibe-bridge", "nudges.json");
+  const rulesPath = path.join(TEST_HOME, "vibe-bridge", "rules.json");
+  const baseConfig = {
+    enabled: true,
+    provider: "spawn",
+    persistWakeState: false,
+    rules: [],
+    nudgeText: "GLOBAL-R",
+    everyTurns: 2,
+    fullEveryTurns: 4,
+    speakOnFirstSeen: false,
+  };
+  const readJson = (file) => JSON.parse(readFileSync(file, "utf8"));
+  const seedRules = (value) => writeFileSync(rulesPath, JSON.stringify(value), "utf8");
+  const rule = (id, content, strategies, extra = {}) => ({ id, type: "rule", content, strategies, ...extra });
+  const textAt = async (ctx, sessionId, turn) => {
+    const decision = await step(ctx.preStep[0], { turn, agent: { id: sessionId, session: { id: sessionId } } });
+    return decision.messages
+      .filter((message) => message.source?.kind === name)
+      .map((message) => message.content.map((part) => part.text).join(""))
+      .join("");
+  };
+
+  await checkAsync("R1 有 enabled 规则 → 用它注入，且不再注入旧的全局规则", async () => {
+    writeFileSync(nudgesPath, "{}", "utf8");
+    seedRules({ "session-r1": [rule("r1", "只用本会话规则", ["every-message"])] });
+    const ctx = makeCtx(Config(baseConfig));
+    const text = await textAt(ctx, "session-r1", 1);
+    assert.match(text, /只用本会话规则/);
+    assert.doesNotMatch(text, /GLOBAL-R/, "有规则时不该再叠加全局文案");
+  });
+
+  await checkAsync("R2 every-message 每轮；every-n(2) 只第 1/3 轮；first-message 只第 1 轮", async () => {
+    seedRules({
+      "session-r2a": [rule("a", "每条都要", ["every-message"])],
+      "session-r2b": [rule("b", "每两轮", ["every-n"], { everyN: 2 })],
+      "session-r2c": [rule("c", "只说一次", ["first-message"])],
     });
     const ctx = makeCtx(Config(baseConfig));
-    const value = await ctx.tools.get("vibe_bridge_status").execute({}, { agent: { id: "runner" } });
-    assertOutputContract(ctx.tools, "vibe_bridge_status", value);
-    for (const row of value.overrides) {
-      assert.equal(typeof row.mode, "string", `${row.sessionId} 的 mode 必须是字符串`);
-      assert.equal(typeof row.textCustom, "boolean");
-      assert.equal(typeof row.textPreview, "string");
-    }
-    const both = value.overrides.find((entry) => entry.sessionId === "both");
-    assert.equal(both.mode, "off");
-    assert.equal(both.textPreview, "T2", "两者都有的条目应带文案预览");
-    const onlyMode = value.overrides.find((entry) => entry.sessionId === "only-mode");
-    assert.equal(onlyMode.textCustom, false);
-    assert.equal(onlyMode.textPreview, "");
+    assert.match(await textAt(ctx, "session-r2a", 2), /每条都要/);
+    assert.equal(await textAt(ctx, "session-r2b", 2), "", "第 2 轮不该注入");
+    assert.match(await textAt(ctx, "session-r2b", 3), /每两轮/);
+    assert.match(await textAt(ctx, "session-r2c", 1), /只说一次/);
   });
 
-  await checkAsync("D3 clear 只清 mode 保留 text；purge 才整条删除", async () => {
-    seed({ "session-clear": { mode: "every:2", text: "PROBE_TEXT_SHOULD_SURVIVE", updatedAt: new Date().toISOString() } });
+  await checkAsync("R3 多策略合并成一段，文案不重复", async () => {
+    seedRules({ "session-r3": [rule("x", "同一句话", ["every-message", "first-message"])] });
     const ctx = makeCtx(Config(baseConfig));
-    const control = ctx.tools.get("nudge_control");
-    const cleared = await control.execute({ session_id: "session-clear", mode: "clear" }, {});
-    assert.equal(cleared.source, "global");
-    const afterClear = state()["session-clear"];
-    assert.equal(afterClear.text, "PROBE_TEXT_SHOULD_SURVIVE", "clear 不该丢文案");
-    assert.equal("mode" in afterClear, false, "clear 应删掉 mode 键");
-    // purge 才整条删除
-    await control.execute({ session_id: "session-clear", mode: "purge" }, {});
-    assert.equal(state()["session-clear"], undefined, "purge 应整条删除");
+    const text = await textAt(ctx, "session-r3", 1);
+    assert.equal(text.split("同一句话").length - 1, 1, "同一句只能出现一次");
+    assert.equal(text.split("[SYSTEM REMINDER:nudge]").length - 1, 1, "同轮合并成一段");
   });
 
-  await checkAsync("D4 nudge_control 一次写 mode + text；text:\"\" 只清文案", async () => {
-    seed({});
+  await checkAsync("R4 规则全部 enabled:false → 回落旧全局规则（不静默零注入）", async () => {
+    seedRules({ "session-r4": [rule("z", "停用的规则", ["every-message"], { enabled: false })] });
     const ctx = makeCtx(Config(baseConfig));
-    const control = ctx.tools.get("nudge_control");
-    const set = await control.execute({ session_id: "session-both", mode: "every:3", text: "BOTH-TEXT" }, {});
-    assert.equal(set.mode, "every:3");
-    const entry = state()["session-both"];
-    assert.equal(entry.mode, "every:3");
-    assert.equal(entry.text, "BOTH-TEXT");
-    await control.execute({ session_id: "session-both", mode: "every:3", text: "" }, {});
-    const clearedText = state()["session-both"];
-    assert.equal(clearedText.mode, "every:3", "清文案不该动 mode");
-    assert.equal("text" in clearedText, false);
+    assert.match(await textAt(ctx, "session-r4", 1), /GLOBAL-R/);
   });
 
-  await checkAsync("D5 无参切换两次：文案仍在、mode 缺失（不再整条删除）", async () => {
-    seed({ "session-toggle": { text: "KEEP-ME", updatedAt: new Date().toISOString() } });
+  await checkAsync("R5 rules:<base64> 非法输入整体拒绝且文件字节不变", async () => {
+    seedRules({ "session-r5": [rule("ok", "合法规则", ["every-message"])] });
+    const before = readFileSync(rulesPath, "utf8");
     const ctx = makeCtx(Config(baseConfig));
     const command = ctx.commands.find((definition) => definition.name === "vibe-nudge");
-    await command.handler({ agent: { id: "session-toggle" }, rawInput: "" });
-    assert.equal(state()["session-toggle"].mode, "off", "第一次点击应关闭（保留文案）");
-    assert.equal(state()["session-toggle"].text, "KEEP-ME");
-    await command.handler({ agent: { id: "session-toggle" }, rawInput: "" });
-    const after = state()["session-toggle"];
-    assert.ok(after !== undefined, "第二次点击不该删掉条目");
-    assert.equal("mode" in after, false, "第二次点击应清掉 mode");
-    assert.equal(after.text, "KEEP-ME", "文案必须保留");
+    const bads = [
+      [{ id: "1", type: "nope", content: "x", strategies: ["every-message"] }],
+      [{ id: "1", type: "rule", content: "x".repeat(4001), strategies: ["every-message"] }],
+      [{ id: "1", type: "rule", content: "x", strategies: ["sometimes"] }],
+      [{ id: "1", type: "rule", content: "x", strategies: ["every-n"], everyN: 0 }],
+    ];
+    for (const bad of bads) {
+      const encoded = Buffer.from(JSON.stringify(bad), "utf8").toString("base64");
+      const out = await command.handler({ agent: { id: "session-r5" }, rawInput: `rules:${encoded}` });
+      assert.equal(out.kind, "error", JSON.stringify(bad));
+    }
+    assert.equal(readFileSync(rulesPath, "utf8"), before, "非法输入不能改文件");
   });
 
-  await checkAsync("D6 回归：既有三条数据（off / every:3+text / 仅 text）的 status 与注入都正确", async () => {
-    seed({
-      "session-a": { mode: "off", updatedAt: new Date().toISOString() },
-      "session-b": { mode: "every:3", text: "SESSION-B-TEXT", updatedAt: new Date().toISOString() },
-      "session-c": { text: "SESSION-C-TEXT", updatedAt: new Date().toISOString() },
-    });
+  await checkAsync("R6 mode=off 压过一切规则（该轮零注入）", async () => {
+    writeFileSync(nudgesPath, JSON.stringify({ "session-r6": { mode: "off", updatedAt: new Date().toISOString() } }), "utf8");
+    seedRules({ "session-r6": [rule("r6", "不该出现", ["every-message"])] });
     const ctx = makeCtx(Config(baseConfig));
-    const value = await ctx.tools.get("vibe_bridge_status").execute({}, { agent: { id: "runner" } });
-    assertOutputContract(ctx.tools, "vibe_bridge_status", value);
-    const byId = (id) => value.overrides.find((entry) => entry.sessionId === id);
-    assert.equal(byId("session-a").mode, "off");
-    assert.equal(byId("session-a").textCustom, false);
-    assert.equal(byId("session-b").mode, "every:3");
-    assert.equal(byId("session-b").textPreview, "SESSION-B-TEXT");
-    assert.equal(byId("session-c").mode, "global", "只有文案的会话节奏仍是 global");
-    assert.equal(byId("session-c").textCustom, true);
-    // 注入：a 关闭、b 用自定义文案每 3 轮、c 用自定义文案按全局（every 2 → 第 1 轮命中）
-    assert.equal(await textAt(ctx, "session-a", 1), "");
-    assert.match(await textAt(ctx, "session-b", 1), /SESSION-B-TEXT/);
-    assert.match(await textAt(ctx, "session-c", 1), /SESSION-C-TEXT/);
-    assert.doesNotMatch(await textAt(ctx, "session-c", 1), /GLOBAL-D/);
+    assert.equal(await textAt(ctx, "session-r6", 1), "", "off 时规则也不注入");
+  });
+
+  await checkAsync("M1 只有 text：当虚拟规则注入（不落盘），两个文件字节不变", async () => {
+    writeFileSync(nudgesPath, JSON.stringify({ "session-m1": { text: "迁移这条", updatedAt: new Date().toISOString() } }), "utf8");
+    const nudgesBefore = readFileSync(nudgesPath, "utf8");
+    const rulesBefore = snapshotFile(rulesPath);
+    const ctx = makeCtx(Config(baseConfig));
+    assert.match(await textAt(ctx, "session-m1", 1), /迁移这条/);
+    assert.equal(readFileSync(nudgesPath, "utf8"), nudgesBefore, "nudges.json 不该被写");
+    assert.equal(snapshotFile(rulesPath), rulesBefore, "rules.json 不该被写（虚拟规则不落盘）");
+  });
+
+  await checkAsync("M2 every:3 + text：虚拟规则按 every-n(3) 注入，文件不变", async () => {
+    writeFileSync(nudgesPath, JSON.stringify({ "session-m2": { mode: "every:3", text: "每三轮", updatedAt: new Date().toISOString() } }), "utf8");
+    const nudgesBefore = readFileSync(nudgesPath, "utf8");
+    const rulesBefore = snapshotFile(rulesPath);
+    const ctx = makeCtx(Config(baseConfig));
+    assert.match(await textAt(ctx, "session-m2", 1), /每三轮/);
+    assert.equal(await textAt(ctx, "session-m2", 2), "", "第 2 轮不该注入");
+    assert.match(await textAt(ctx, "session-m2", 4), /每三轮|自检一遍/, "第 4 轮是第 2 个 N 周期（去重时只发短句）");
+    assert.equal(readFileSync(nudgesPath, "utf8"), nudgesBefore);
+    assert.equal(snapshotFile(rulesPath), rulesBefore);
+  });
+
+  await checkAsync("M3 幂等：再 apply 一次，两个文件都不变", async () => {
+    writeFileSync(nudgesPath, JSON.stringify({ "session-m3": { text: "只迁一次", updatedAt: new Date().toISOString() } }), "utf8");
+    writeFileSync(rulesPath, "{}", "utf8");
+    makeCtx(Config(baseConfig));
+    const nudgesFirst = readFileSync(nudgesPath, "utf8");
+    const rulesFirst = readFileSync(rulesPath, "utf8");
+    makeCtx(Config(baseConfig));
+    assert.equal(readFileSync(nudgesPath, "utf8"), nudgesFirst);
+    assert.equal(readFileSync(rulesPath, "utf8"), rulesFirst);
+  });
+
+  await checkAsync("M4 mode:off 原样保留、不生成规则", async () => {
+    writeFileSync(nudgesPath, JSON.stringify({ "session-m4": { mode: "off", updatedAt: new Date().toISOString() } }), "utf8");
+    writeFileSync(rulesPath, "{}", "utf8");
+    makeCtx(Config(baseConfig));
+    assert.equal(readJson(nudgesPath)["session-m4"].mode, "off");
+    assert.equal(readJson(rulesPath)["session-m4"], undefined, "off 不该生成规则");
+  });
+
+  await checkAsync("M5 已有真实规则时虚拟规则不参与（text 只剩在 nudges.json 里，两条都不写）", async () => {
+    writeFileSync(nudgesPath, JSON.stringify({ "session-m5": { text: "旧文案", updatedAt: new Date().toISOString() } }), "utf8");
+    seedRules({ "session-m5": [rule("keep", "用户改过的规则", ["every-message"])] });
+    const nudgesBefore = readFileSync(nudgesPath, "utf8");
+    const rulesBefore = readFileSync(rulesPath, "utf8");
+    const ctx = makeCtx(Config(baseConfig));
+    const text = await textAt(ctx, "session-m5", 1);
+    assert.match(text, /用户改过的规则/);
+    assert.doesNotMatch(text, /旧文案/, "有真实规则时虚拟规则不参与");
+    assert.equal(readFileSync(nudgesPath, "utf8"), nudgesBefore);
+    assert.equal(readFileSync(rulesPath, "utf8"), rulesBefore);
+  });
+
+  await checkAsync("R7 text:<base64> 兼容别名：写/覆盖第一条规则；空则清空那一条", async () => {
+    writeFileSync(nudgesPath, "{}", "utf8");
+    writeFileSync(rulesPath, "{}", "utf8");
+    const ctx = makeCtx(Config(baseConfig));
+    const command = ctx.commands.find((definition) => definition.name === "vibe-nudge");
+    const send = async (value) => {
+      const payload = Buffer.from(value, "utf8").toString("base64");
+      return command.handler({ agent: { id: "session-alias" }, rawInput: `text:${payload}` });
+    };
+    const created = await send("第一版文案");
+    assert.equal(created.kind, "success", "text: 不该再报已移除");
+    let list = JSON.parse(readFileSync(rulesPath, "utf8"))["session-alias"];
+    assert.equal(list.length, 1);
+    assert.equal(list[0].content, "第一版文案");
+    assert.deepEqual(list[0].strategies, ["every-message"]);
+    await send("第二版文案");
+    list = JSON.parse(readFileSync(rulesPath, "utf8"))["session-alias"];
+    assert.equal(list.length, 1, "覆盖而不是追加");
+    assert.equal(list[0].content, "第二版文案");
+    const cleared = await command.handler({ agent: { id: "session-alias" }, rawInput: "text:" });
+    assert.equal(cleared.kind, "success");
+    assert.equal(JSON.parse(readFileSync(rulesPath, "utf8"))["session-alias"], undefined, "空 text: 清掉那一条（不留空内容规则）");
+    assert.match(await textAt(ctx, "session-alias", 1), /GLOBAL-R/, "清空后回落旧路径");
+  });
+
+  await checkAsync("E4 真实 home 未被这轮用例写脏", async () => {
+    assert.equal(snapshotFile(path.join(REAL_HOME, "vibe-bridge", "rules.json")), realHomeSnapshot.rules, "rules.json 不该被测试写到");
+    assert.equal(snapshotFile(path.join(REAL_HOME, "vibe-bridge", "nudges.json")), realHomeSnapshot.nudges, "nudges.json 不该被测试写到");
   });
 
   console.log(results.slice(firstNew).join("\n"));
 };
+
 
 run()
   .then(wakeCheck)
@@ -1550,6 +1609,7 @@ run()
   .then(sessionNudgeCheck)
   .then(nudgeTextCheck)
   .then(defectCheck)
+  .then(rulesCheck)
   .then(() => {
     const failed = results.filter((line) => line.startsWith("FAIL"));
     console.log("");
