@@ -719,4 +719,36 @@ await check("弹窗：状态行按规则报本会话（不是“生效：全局�
   assert.match(textOf(renderDialog()), /本会话未配置规则（不会注入）/);
 });
 
+await check("面板：每个会话行都有 复制 id / 碎碎念 / 建子会话（子会话此前纯文本，操作不了）", async () => {
+  const rendered = pageEntry.component({ ...pageProps });
+  const copies = collect(rendered, (node) => node.props?.["data-action"] === "copy-id");
+  // 1 个父行 + 2 个子行
+  assert.equal(copies.length, 3, `复制 id 按钮数应为 3，实际 ${copies.length}`);
+  const ids = copies.map((node) => node.props["data-session-id"]);
+  assert.deepEqual(ids.sort(), ["child-aaaa-1111", "child-bbbb-2222", "session-parent-1"]);
+
+  const nudges = collect(rendered, (node) => node.props?.["data-action"] === "row-nudge");
+  assert.equal(nudges.length, 2, "每个子会话行都要有碎碎念入口");
+  const spawns = collect(rendered, (node) => node.props?.["data-action"] === "row-spawn");
+  assert.equal(spawns.length, 2, "每个子会话行都要能以它为父建子会话");
+
+  // 复制真的写进剪贴板（Node 里 navigator 只有 getter，用 defineProperty 覆盖）
+  const written = [];
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { clipboard: { writeText: async (text) => void written.push(text) } },
+  });
+  await copies[0].props.onClick();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(written.length, 1, "点复制应写一次剪贴板");
+  assert.equal(written[0], copies[0].props["data-session-id"], "写进剪贴板的应是被点那一行的 session id");
+
+  // 碎碎念入口带的是该子会话的 id
+  const opened = [];
+  const withNudge = pageEntry.component({ ...pageProps, openNudgeEditor: (id) => void opened.push(id) });
+  const nudgeBtn = collect(withNudge, (node) => node.props?.["data-action"] === "row-nudge")[0];
+  nudgeBtn.props.onClick();
+  assert.deepEqual(opened, ["child-aaaa-1111"], "碎碎念入口应打开该子会话");
+});
+
 console.log(results.join("\n"));
