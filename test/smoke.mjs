@@ -1279,12 +1279,99 @@ const sessionNudgeCheck = async () => {
   console.log(results.slice(firstNew).join("\n"));
 };
 
+// ---------------------------------------------------------------------------
+// C：按会话文案（text:<base64>）+ status 的 session:/status all 形状
+// ---------------------------------------------------------------------------
+const nudgeTextCheck = async () => {
+  const firstNew = results.length;
+  const nudgesPath = path.join(TEST_HOME, "vibe-bridge", "nudges.json");
+  const baseConfig = {
+    enabled: true,
+    provider: "spawn",
+    persistWakeState: false,
+    rules: [],
+    nudgeText: "GLOBAL-TEXT",
+    everyTurns: 2,
+    fullEveryTurns: 4,
+    speakOnFirstSeen: false,
+  };
+  writeFileSync(nudgesPath, "{}", "utf8");
+  const ctx = makeCtx(Config(baseConfig));
+  const command = ctx.commands.find((definition) => definition.name === "vibe-nudge");
+  const b64 = (text) => Buffer.from(text, "utf8").toString("base64");
+  /** 某会话某轮注入的正文（没有注入返回空串）。 */
+  const textAt = async (sessionId, turn) => {
+    const decision = await step(ctx.preStep[0], { turn, agent: { id: sessionId, session: { id: sessionId } } });
+    return decision.messages
+      .filter((message) => message.source?.kind === name)
+      .map((message) => message.content.map((part) => part.text).join(""))
+      .join("");
+  };
+
+  await command.handler({ agent: { id: "session-t1" }, rawInput: `text:${b64("CUSTOM-ONE")}` });
+
+  await checkAsync("C1 会话自定义文案：该会话注入自定义文案，其它会话不受影响", async () => {
+    assert.match(await textAt("session-t1", 1), /CUSTOM-ONE/);
+    const other = await textAt("session-t2", 1);
+    assert.match(other, /GLOBAL-TEXT/);
+    assert.doesNotMatch(other, /CUSTOM-ONE/);
+  });
+
+  await checkAsync("C2 text: 清空 → 回落全局文案", async () => {
+    await command.handler({ agent: { id: "session-t1" }, rawInput: "text:" });
+    const text = await textAt("session-t1", 3);
+    assert.match(text, /GLOBAL-TEXT/);
+    assert.doesNotMatch(text, /CUSTOM-ONE/);
+    assert.equal(JSON.parse(readFileSync(nudgesPath, "utf8"))["session-t1"], undefined, "无模式也没文案时应整条删除");
+  });
+
+  await checkAsync("C3 off 与文案共存：off 不注入，但文案仍在盘上", async () => {
+    await command.handler({ agent: { id: "session-t3" }, rawInput: `text:${b64("KEEP-ME")}` });
+    await command.handler({ agent: { id: "session-t3" }, rawInput: "off" });
+    assert.equal(await textAt("session-t3", 1), "", "off 时不该注入");
+    const entry = JSON.parse(readFileSync(nudgesPath, "utf8"))["session-t3"];
+    assert.equal(entry.mode, "off");
+    assert.equal(entry.text, "KEEP-ME", "文案应保留在盘上");
+  });
+
+  await checkAsync("C4 status 的 session: 行（有自定义 / 无自定义两种形状）", async () => {
+    await command.handler({ agent: { id: "session-t1" }, rawInput: `text:${b64("AGAIN")}` });
+    const withText = await command.handler({ agent: { id: "session-t1" }, rawInput: "status" });
+    assert.match(withText.text, new RegExp(`^session: mode=\\S+ text=${b64("AGAIN")}$`, "m"));
+    const plain = await command.handler({ agent: { id: "session-t9" }, rawInput: "status" });
+    assert.match(plain.text, /^session: mode=global text=empty$/m);
+    // 前 3 行保持原状（客户端设置卡片依赖它）
+    assert.match(plain.text, /^every \d+ · full every \d+ · from turn \d+/m);
+    assert.match(plain.text, /^overrides: \d+/m);
+  });
+
+  await checkAsync("C5 status all：固定格式（global 行 + 只列有覆盖的会话）", async () => {
+    const all = await command.handler({ agent: { id: "session-t1" }, rawInput: "status all" });
+    const lines = all.text.split("\n");
+    assert.equal(lines[0], "global: every 2 · full 4 · from 1");
+    assert.ok(lines.includes("session-t1: global text=yes"), all.text);
+    assert.ok(lines.includes("session-t3: off text=yes"), all.text);
+    assert.ok(!lines.some((line) => line.startsWith("session-t9:")), "没有覆盖的会话不该出现");
+  });
+
+  await checkAsync("C6 status all：没有任何覆盖时只回 global 行", async () => {
+    writeFileSync(nudgesPath, "{}", "utf8");
+    const fresh = makeCtx(Config(baseConfig));
+    const freshCommand = fresh.commands.find((definition) => definition.name === "vibe-nudge");
+    const all = await freshCommand.handler({ agent: { id: "session-z" }, rawInput: "status all" });
+    assert.equal(all.text, "global: every 2 · full 4 · from 1");
+  });
+
+  console.log(results.slice(firstNew).join("\n"));
+};
+
 run()
   .then(wakeCheck)
   .then(deliveryCheck)
   .then(notifyCheck)
   .then(scheduleCheck)
   .then(sessionNudgeCheck)
+  .then(nudgeTextCheck)
   .then(() => {
     const failed = results.filter((line) => line.startsWith("FAIL"));
     console.log("");

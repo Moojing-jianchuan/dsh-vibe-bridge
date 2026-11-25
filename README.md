@@ -140,7 +140,35 @@ Priority for every cadence field is **rule field > top-level scalar > built-in d
 
 The host command `/vibe-spawn <label>|<task>` backs the UI's *Create child session* action, so creating a child never costs a parent model turn.
 
-### Settings card and per-session switches
+### Panel layout and the reminder editor
+
+The sidebar entry (`Vibe Bridge`) opens the panel, top to bottom:
+
+1. **Title + description**, with the four usage lines folded in as text (`spawn_session …`, `list_sessions …`,
+   `post_to_session …`, `vibe_bridge_status …`). There is no separate "usage" card any more.
+2. **Parent and child conversations** (read-only): `父对话 <id8> · <title>`, then one indented line per child —
+   `子会话 <id8> · <label> · <task, first 40 chars>` — built from `listSessions()` and the `subagentCatalog`
+   projection. The old "parent session id / task" dispatcher form is gone.
+3. **Session tree** with the *Create child session* button in its header (it opens the same `VibeSpawnDialog`,
+   pre-filled with the first parent session) plus *Refresh*; every child row keeps its message box and *Send*.
+4. **What this plugin adds** — one text block instead of three cards.
+5. **Reminder rules in effect**, one line per conversation, built from a single `/vibe-nudge status all` call:
+   `父对话 a1b2c3d4 · 每 4 轮（全局文案）`, `子会话 e5f6a7b8 · 已关闭`, `子会话 … · 每 3 轮（本会话文案）`.
+   A conversation that has no override shows the global cadence with "全局文案"; nothing here reads or prints
+   `cordis.patch.yml`.
+
+**Right-click any session → 「碎碎念编辑」** (child rows included) opens a dialog scoped to that conversation:
+
+- title `碎碎念 · <id8>`, a read-only status line (`生效：全局 / 已关闭 / 稀疏 / 全量 / 每 N 轮 · 文案：全局/本会话`),
+- **打开** = `/vibe-nudge on` (back to the global rules), **关闭** = `/vibe-nudge off`, **编辑** = a textarea
+  pre-filled with that session's own text (empty = "use the global text") with **保存 / 取消** — saving sends
+  `/vibe-nudge text:<base64>`, saving an empty box clears the custom text,
+- the line `仅作用于本次对话；子会话同样适用。`, a ✕ button, and overlay-click / Esc to close.
+
+Everything the panel and the dialog change goes through `ctx.remote.commands.execute(session, line, [])`; the client
+never reads or writes `nudges.json` itself.
+
+### Settings card
 
 - **Settings → Plugins → Vibe Bridge** shows an editable card built on `SettingsFormModel`: cadence (`everyTurns`,
   `fullEveryTurns`, `fromTurn`), the global `nudgeText`, and the two booleans (`skipSubagentSessions`,
@@ -149,11 +177,8 @@ The host command `/vibe-spawn <label>|<task>` backs the UI's *Create child sessi
 - Booleans are **text fields** (`true` / `false`, empty = default): the only field primitive the Host ships is a text
   input, so there is no toggle control to use.
 - Below the form sits a read-only summary: the effective cadence and how many sessions have their own override. The
-  client cannot read `nudges.json`, so the count comes from the host command `/vibe-nudge status` (issued against the
-  first session as an anchor); when that answer is missing the line says "unavailable" instead of guessing.
-- **Right-click a session → “碎碎念：本会话关闭” / “碎碎念：本会话恢复全局”** send `/vibe-nudge off` and
-  `/vibe-nudge on` through `ctx.remote.commands.execute(session, line, [])`. Both items also appear on child-session
-  rows, and a failure is swallowed so a missing host command can never break the context menu.
+  client cannot read `nudges.json`, so the count comes from `/vibe-nudge status`; when that answer is missing the line
+  says "unavailable" instead of guessing.
 
 ## Delivery visibility: injects, three states, who-may-message-whom, notices, workspace scope
 
@@ -303,31 +328,36 @@ Rows from your own workspace come first, then newest first. This is also how you
 
 ### 6. Per-session nudges (`nudges.json`)
 
-The cadence is global; a single session can opt out (or get a different rhythm) without touching the configuration:
+The cadence is global; a single session can opt out, get a different rhythm, **or carry its own text** without
+touching the configuration:
 
 ```jsonc
 // $DSH_HOME/vibe-bridge/nudges.json — written atomically, read on every pre-step (mtime-cached)
-{ "session-abc": { "mode": "off", "updatedAt": "2026-11-25T04:57:39.052Z" } }
+{ "session-abc": { "mode": "off", "text": "这篇先别催我", "updatedAt": "2026-11-25T04:57:39.052Z" } }
 ```
 
-| `mode` | Effect for that session |
+| field | Meaning |
 |---|---|
-| `off` | no nudges at all |
-| `sparse` | only on turns the global cadence classifies as sparse |
-| `full` | every turn, full text |
-| `every:N` | turns 1, 1+N, 1+2N… with the full text |
-| *(no entry)* | the global rules |
+| `mode: "off"` | no nudges at all for that session |
+| `mode: "sparse"` | only on turns the global cadence classifies as sparse |
+| `mode: "full"` | every turn, full text |
+| `mode: "every:N"` | turns 1, 1+N, 1+2N… with the full text |
+| `mode` absent | the global rules |
+| `text` | this session's own full text (an empty value means "no custom text") |
 
-Precedence is **session override > `rules[]` > top-level scalars > defaults**. A `full` / `every:N` override takes its
-text from the first rule (or `nudgeText`, or the bundled `nudge.md` when there is no rule), and the child-done notices
-are unaffected by it.
+Text precedence is **session `text` > `nudgeText` > `rule.file` > `rule.text` > bundled `nudge.md`**, while the cadence
+precedence stays **session `mode` > `rules[]` > top-level scalars > defaults**. `off` suppresses injection but keeps a
+stored `text` on disk, so re-enabling does not lose it. Child-done notices are unaffected by all of this.
 
 Three ways to set it — all of them land in the same file, so they survive a restart:
 
 - `nudge_control(session_id, mode)` (model tool),
-- `/vibe-nudge [off|on|sparse|full|every:N|clear]` (no argument toggles `off` ↔ global), plus `/vibe-nudge status` for
-  a read-only summary of the effective cadence and the current overrides,
-- the session context menu (the two items described above).
+- `/vibe-nudge …` on the host: `off` | `on` | `sparse` | `full` | `every:N` | `clear` (no argument toggles
+  `off` ↔ global), `text:<base64>` to set this session's text (`text:` clears it), `status` for one session
+  (`every … / rules: … / overrides: …` plus a `session: mode=… text=<base64|empty>` line for pre-filling the dialog),
+  and `status all` for the panel (`global: every N · full M · from K` + one `<id>: <mode> text=yes|no` line per
+  overridden session),
+- the right-click 「碎碎念编辑」 dialog described above.
 
 A broken or unreadable `nudges.json` is treated as an empty table (one `warn` in the log, never an exception inside
 `agent/pre-step`), so a hand-edited file cannot wedge a turn.

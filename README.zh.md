@@ -141,12 +141,29 @@ Windows 上依赖联接用的是目录 junction，不需要管理员权限、也
 
 宿主命令 `/vibe-spawn <名字>|<任务>` 就是界面里「创建子会话」背后的那条路径 —— 所以建子会话不消耗父会话的任何模型轮次。
 
-### 设置卡片与会话开关
+### 面板布局与碎碎念编辑
+
+左侧栏入口（`Vibe Bridge`）打开的面板，自上而下：
+
+1. **标题 + 描述**，原来的四条「用法」并入描述文字（`spawn_session …`、`list_sessions …`、`post_to_session …`、`vibe_bridge_status …`），不再有独立的「用法」区块。
+2. **父对话及其子对话**（只读）：`父对话 <id8> · <标题>`，其下缩进每个子会话 `子会话 <id8> · <label> · <任务描述，截断 40 字>`；数据来自 `listSessions()` 与 `subagentCatalog` 投影。原「父会话 id / 任务」调度台表单已删除。
+3. **会话树**：树头放了「创建子会话」（打开的还是那个 `VibeSpawnDialog`，默认父会话取列表里第一个）和「刷新」；每行的 draft 输入 + 发送不变。
+4. **这个插件带来什么**：三张卡片改成一段文字。
+5. **碎碎念规则**：逐会话列出实际生效配置，数据来自**一次** `/vibe-nudge status all` 调用 —— `父对话 a1b2c3d4 · 每 4 轮（全局文案）`、`子会话 e5f6a7b8 · 已关闭`、`子会话 … · 每 3 轮（本会话文案）`。没有覆盖的会话显示全局节奏 + “全局文案”；这里不读也不显示 `cordis.patch.yml`。
+
+**右键任一会话 →「碎碎念编辑」**（子会话行同样有）弹出只作用于该对话的弹窗：
+
+- 标题 `碎碎念 · <id8>`，只读状态行（`生效：全局 / 已关闭 / 稀疏 / 全量 / 每 N 轮 · 文案：全局/本会话`）；
+- **打开** = `/vibe-nudge on`（回落全局），**关闭** = `/vibe-nudge off`，**编辑** 展开多行输入（预填该会话自定义文案，空 = “使用全局文案”），**保存 / 取消**；保存发 `/vibe-nudge text:<base64>`，留空保存 = 清除自定义文案；
+- 弹窗里有一行 `仅作用于本次对话；子会话同样适用。`，右上角 ✕，点遮罩或按 Esc 也可关闭。
+
+面板与弹窗的一切改动都走 `ctx.remote.commands.execute(会话, 命令, [])`，客户端自身从不读写 `nudges.json`。
+
+### 设置卡片
 
 - **设置 → 插件 → Vibe Bridge** 是一张可编辑卡片：节奏（`everyTurns`、`fullEveryTurns`、`fromTurn`）、全局 `nudgeText`、以及两个布尔项（`skipSubagentSessions`、`speakOnFirstSeen`），带保存/放弃。卡片只在宿主服务本插件命名空间时注册（`configForms.whileServed`）；老版本宿主上退回只读状态行。
-- 布尔项用的是**文本框**（`true` / `false`，留空=默认）：宿主提供的字段原语只有文本输入，没有开关控件，所以这是当前唯一的做法。
-- 表单下方是只读摘要：当前生效节奏 + 有多少会话被单独覆盖。客户端读不了 `nudges.json`，所以覆盖数来自宿主命令 `/vibe-nudge status`（拿第一个会话做锚点）；拿不到就写“取不到”，不猜。
-- **右键会话 →「碎碎念：本会话关闭」/「本会话恢复全局」** 分别发 `/vibe-nudge off` 与 `/vibe-nudge on`（走 `ctx.remote.commands.execute(会话, 命令, [])`）。子会话行同样有这两项；失败静默，旧宿主没有该命令也不会把右键菜单弄崩。
+- 布尔项用的是**文本框**（`true` / `false`，留空=默认）：宿主提供的字段原语只有文本输入，没有开关控件。
+- 表单下方是只读摘要：当前生效节奏 + 有多少会话被单独覆盖。覆盖数来自 `/vibe-nudge status`；拿不到就写“取不到”，不猜。
 
 ## 投递可见性：注入段、三态、谁能给谁发、通知来源、workspace 列表
 
@@ -254,28 +271,29 @@ a1f82c62-… [inactive] (top-level) — 重建工作区  ·  D:\ds_work  ·  --D
 
 ### 6. 按会话注入（`nudges.json`）
 
-节奏是全局的；单个会话可以单独关掉或换节奏，不用改配置：
+节奏是全局的；单个会话可以单独关掉、换节奏，**或者带一份自己的文案**，都不用改配置：
 
 ```jsonc
 // $DSH_HOME/vibe-bridge/nudges.json —— 原子写；每次 pre-step 读（按 mtime 缓存）
-{ "session-abc": { "mode": "off", "updatedAt": "2026-11-25T04:57:39.052Z" } }
+{ "session-abc": { "mode": "off", "text": "这篇先别催我", "updatedAt": "2026-11-25T04:57:39.052Z" } }
 ```
 
-| `mode` | 对该会话的效果 |
+| 字段 | 对该会话的效果 |
 |---|---|
-| `off` | 完全不注入 |
-| `sparse` | 只在全局判定为「稀疏」的轮次注入 |
-| `full` | 每轮注入全量文案 |
-| `every:N` | 第 1、1+N、1+2N… 轮注入全量文案 |
-| *（无条目）* | 按全局规则 |
+| `mode: "off"` | 完全不注入 |
+| `mode: "sparse"` | 只在全局判定为「稀疏」的轮次注入 |
+| `mode: "full"` | 每轮注入全量文案 |
+| `mode: "every:N"` | 第 1、1+N、1+2N… 轮注入全量文案 |
+| 没有 `mode` | 按全局规则 |
+| `text` | 该会话自己的全量文案（空值 = 没有自定义文案） |
 
-优先级：**会话覆盖 > `rules[]` > 顶层标量 > 默认**。`full` / `every:N` 的文案取自第一条规则（或 `nudgeText`，没有规则时回落包内 `nudge.md`）；子会话完成通知不受它影响。
+文案优先级：**会话 `text` > `nudgeText` > `rule.file` > `rule.text` > 包内 `nudge.md`**；节奏优先级仍是 **会话 `mode` > `rules[]` > 顶层标量 > 默认**。`off` 只抑制注入，盘上的 `text` 会保留，重新打开不会丢。子会话完成通知不受影响。
 
 三个入口写的是同一个文件，所以重启后依然生效：
 
 - `nudge_control(session_id, mode)`（模型工具）；
-- `/vibe-nudge [off|on|sparse|full|every:N|clear]`（无参 = 在 `off` ↔ 全局之间切换），另有 `/vibe-nudge status` 输出只读摘要（当前节奏 + 现有覆盖）；
-- 会话右键菜单的两项（见上）。
+- 宿主命令 `/vibe-nudge …`：`off` | `on` | `sparse` | `full` | `every:N` | `clear`（无参 = 在 `off` ↔ 全局之间切换），`text:<base64>` 设置本会话文案（`text:` 清空），`status` 给单个会话（`every … / rules: … / overrides: …` 外加一行 `session: mode=… text=<base64|empty>` 供弹窗预填），`status all` 给面板（首行 `global: every N · full M · from K`，之后每个有覆盖的会话一行 `<id>: <mode> text=yes|no`）；
+- 右键「碎碎念编辑」弹窗（见上）。
 
 `nudges.json` 坏掉或读不到时一律当空表处理（只记一次 `warn`，**绝不**让 `agent/pre-step` 抛错），所以手改成坏文件也不会卡住一轮。
 

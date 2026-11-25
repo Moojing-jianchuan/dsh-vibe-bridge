@@ -4,9 +4,10 @@
  * 不开浏览器，复刻 dsh-client-modules 的加载契约：
  *   window.__ModuleLoader__.load({ id, factory })  →  factory(require)  →  { apply, inject }
  * 用假的 slots / locale / configForms / layout / remote 跑一遍 apply，断言：
- *   1) 注册了五个面：左侧栏入口、主页面、设置行、两个会话菜单项；
- *   2) 会话菜单项点下去会把 sessionId 交给调度台并关掉菜单；
- *   3) 主页面在三种配置状态下渲染，且提交表单会调到 spawnChild。
+ *   1) 注册了哪些面：左侧栏入口、主页面、一个会话菜单项、两个 overlay、设置卡片；
+ *   2) 面板新布局：用法并入描述、父/子对话展示、树头「创建子会话」、逐会话碎碎念规则；
+ *   3) 右键「碎碎念编辑」弹窗：标题、打开/关闭/编辑（base64 文案）、关闭按钮；
+ *   4) 设置卡片：字段、保存/放弃、摘要。
  *
  * 运行：node test/client-smoke.mjs
  */
@@ -14,9 +15,10 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 const results = [];
-const check = (title, fn) => {
+/** 支持异步断言的 check（顶层 await 逐个等待，保证顺序与失败可见）。 */
+const check = async (title, fn) => {
   try {
-    fn();
+    await fn();
     results.push(`PASS  ${title}`);
   } catch (error) {
     results.push(`FAIL  ${title}\n      ${error?.message ?? error}`);
@@ -108,8 +110,8 @@ const source = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8"
 new Function("window", source)(globalThis.window);
 const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 
-check("bundle 已向模块加载器注册", () => assert.ok(registration));
-check("id 与 package.json name 一致", () => assert.equal(registration.id, pkg.name));
+await check("bundle 已向模块加载器注册", () => assert.ok(registration));
+await check("id 与 package.json name 一致", () => assert.equal(registration.id, pkg.name));
 
 const loaded = registration.factory((specifier) => {
   const found = moduleTable[specifier];
@@ -117,7 +119,7 @@ const loaded = registration.factory((specifier) => {
   return found;
 });
 
-check("导出 apply / inject（含 remote.session / remote.commands）", () => {
+await check("导出 apply / inject（含 remote.session / remote.commands）", () => {
   assert.equal(typeof loaded.apply, "function");
   assert.deepEqual(loaded.inject, ["slots", "locale", "configForms", "layout", "remote", "remote.session", "remote.commands"]);
 });
@@ -130,7 +132,21 @@ const panels = [];
 const prompts = [];
 const commands = [];
 const fakeForm = { value: { everyTurns: 4, fullEveryTurns: 12, fromTurn: 1, nudgeText: "" }, getSnapshot: () => fakeForm };
-const statusText = "every 4 · full every 12 · from turn 1\nrules: nudge every 4/full 12\noverrides: 2 (session-a → off, session-b → every:3)";
+const statusText = "every 4 · full every 12 · from turn 1\nrules: nudge every 4/full 12\noverrides: 2 (session-a → off, session-b → every:3)\nsession: mode=every:3 text=";
+const statusAllText = "global: every 4 · full 12 · from 1\nchild-aaaa-1111: off text=no\nchild-bbbb-2222: every:3 text=yes";
+/** 面板父/子展示的数据源（与 session.list 桩一致）。 */
+const SAMPLE_SESSIONS = [
+  {
+    sessionId: "session-parent-1",
+    projections: {
+      sessionTitle: { title: "父对话标题" },
+      subagentCatalog: [
+        { id: "child-aaaa-1111", label: "甲", task: "给 A 模块补测试，完成后回报结果，不要改其它文件", running: true },
+        { id: "child-bbbb-2222", label: "乙", task: "分析日志", running: false },
+      ],
+    },
+  },
+];
 const ctx = {
   effect: (fn) => {
     const dispose = fn();
@@ -142,13 +158,25 @@ const ctx = {
   },
   configForms: {
     get: (namespace) => ({ ...fakeForm, namespace }),
-    // 真实服务在命名空间被服务时回调；桩里直接当作“已服务”。
     whileServed: (namespaces, register) => register(new Set(namespaces)),
   },
   layout: { selectPanel: (id) => panels.push(id) },
   remote: {
     session: {
-      list: async () => ({ items: [{ sessionId: "session-anchor" }] }),
+      list: async () => ({
+        items: [
+          {
+            sessionId: "session-parent-1",
+            projections: {
+              sessionTitle: { title: "父对话标题" },
+              subagentCatalog: [
+                { id: "child-aaaa-1111", label: "甲", task: "给 A 模块补测试，完成后回报结果，不要改其它文件", running: true },
+                { id: "child-bbbb-2222", label: "乙", task: "分析日志", running: false },
+              ],
+            },
+          },
+        ],
+      }),
       prompt: async (request) => {
         prompts.push(request);
         return { messageId: "msg-1" };
@@ -157,12 +185,9 @@ const ctx = {
     commands: {
       execute: async (sessionId, line, attachments) => {
         commands.push({ sessionId, line, attachments });
-        if (line === "/vibe-nudge status") {
-          return { ok: true, value: { result: { kind: "success", text: statusText } } };
-        }
-        if (line.startsWith("/vibe-nudge")) {
-          return { ok: true, value: { result: { kind: "success", text: "本会话碎碎念：ok" } } };
-        }
+        if (line === "/vibe-nudge status all") return { ok: true, value: { result: { kind: "success", text: statusAllText } } };
+        if (line === "/vibe-nudge status") return { ok: true, value: { result: { kind: "success", text: statusText } } };
+        if (line.startsWith("/vibe-nudge")) return { ok: true, value: { result: { kind: "success", text: "ok" } } };
         return { ok: true, value: { result: { kind: "success", text: "session started: child-from-command" } } };
       },
     },
@@ -191,134 +216,6 @@ const byId = (id) => registered.find((entry) => entry.meta.id === id);
 const dict = locales[0].dicts.zh;
 const t = (key) => dict[key];
 
-check("注册了八个面（含可编辑设置卡片）", () => {
-  assert.equal(registered.length, 8);
-  assert.deepEqual([...new Set(injectedSlots)].sort(), [
-    "main",
-    "plugins.item",
-    "shell.overlay",
-    "sidebar.panellist",
-    "sidebar.workspaces.session.menu.item",
-  ]);
-});
-
-check("左侧栏入口：id/order/label 正确", () => {
-  const { meta } = byName("sidebar.panellist")[0];
-  assert.equal(meta.id, "vibe-bridge");
-  assert.equal(meta.order, 40);
-  assert.equal(meta.label(), "Vibe Bridge");
-});
-
-check("主页面：key 与入口 id 一致", () => {
-  const { meta } = byName("main")[0];
-  assert.equal(meta.key, "vibe-bridge");
-  assert.equal(meta.locale, "vibeBridge");
-});
-
-check("设置卡片：注册在 plugins.item 上（不再是只读行）", () => {
-  const { meta } = registered.find((entry) => entry.meta.name === "plugins.item" && entry.meta.id === "vibe-bridge");
-  assert.equal(meta.name, "plugins.item");
-  assert.equal(meta.order, 40);
-  assert.equal(meta.label(), "碎碎念节奏");
-  assert.equal(byId("vibe-bridge-status"), undefined, "有表单模型时不该再注册只读行");
-});
-
-check("会话菜单：四个菜单项 id/order 正确", () => {
-  const create = byId("vibe-create-child");
-  const consoleItem = byId("vibe-console");
-  const off = byId("vibe-nudge-off");
-  const reset = byId("vibe-nudge-reset");
-  for (const item of [create, consoleItem, off, reset]) {
-    assert.equal(item.meta.name, "sidebar.workspaces.session.menu.item");
-  }
-  assert.deepEqual([create.meta.order, consoleItem.meta.order, off.meta.order, reset.meta.order], [460, 461, 462, 463]);
-});
-
-check("菜单项「创建子会话」打开弹窗并关闭菜单", () => {
-  const { component } = byId("vibe-create-child");
-  let closed = false;
-  const element = component({
-    sessionId: "session-abc",
-    useMenuOpenState: () => [true, (next) => (closed = next === false)],
-    t,
-  });
-  assert.equal(element.type, "MenuItemButton");
-  assert.equal(element.props.children, "创建子会话");
-  element.props.onSelect();
-  assert.equal(closed, true);
-});
-
-check("弹窗：菜单点过后渲染出任务输入框与创建按钮", () => {
-  const overlay = byId("vibe-bridge-spawn-dialog");
-  const face = overlay.meta.inject();
-  const rendered = overlay.component({ t, spawnChild: async () => {}, ...face });
-  assert.ok(rendered, "弹窗应渲染");
-  /** 在渲染树里找第一个满足条件的节点。 */
-  const find = (node, predicate) => {
-    if (node === null || typeof node !== "object") return undefined;
-    if (Array.isArray(node)) {
-      for (const child of node) {
-        const hit = find(child, predicate);
-        if (hit !== undefined) return hit;
-      }
-      return undefined;
-    }
-    if (predicate(node)) return node;
-    return find(node.props?.children, predicate);
-  };
-  assert.ok(find(rendered, (node) => node.type === "textarea"), "应有任务输入框");
-  assert.ok(
-    find(rendered, (node) => node.type === "button" && node.props?.children === "创建子会话"),
-    "应有创建按钮",
-  );
-});
-
-// 提交是异步的：单独跑，避免同步 check 抢跑。
-{
-  const overlay = byId("vibe-bridge-spawn-dialog");
-  const face = overlay.meta.inject();
-  const props = { t };
-  const rendered = overlay.component({ ...props, ...face });
-  const find = (node, predicate) => {
-    if (node === null || typeof node !== "object") return undefined;
-    if (Array.isArray(node)) {
-      for (const child of node) {
-        const hit = find(child, predicate);
-        if (hit !== undefined) return hit;
-      }
-      return undefined;
-    }
-    if (predicate(node)) return node;
-    return find(node.props?.children, predicate);
-  };
-  find(rendered, (node) => node.type === "textarea").props.onChange({ target: { value: "给 A 模块补测试" } });
-  find(rendered, (node) => node.type === "button" && node.props?.children === "创建子会话").props.onClick();
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  check("弹窗提交：走宿主命令 /vibe-spawn 直接建会话，成功后关闭", () => {
-    const call = commands.at(-1);
-    assert.equal(call.sessionId, "session-abc", "命令要跑在被点中的父会话上");
-    assert.equal(call.line, "/vibe-spawn child|给 A 模块补测试");
-    assert.deepEqual(call.attachments, []);
-    assert.equal(prompts.length, 0, "不应再往父会话投 prompt（那样要等模型一轮）");
-    assert.equal(overlay.component({ ...props, ...face }), null, "拿到 id 后弹窗关闭");
-  });
-}
-
-check("菜单项「打开调度台」不预设父会话", () => {
-  const { component, meta } = byId("vibe-console");
-  const face = meta.inject();
-  let closed = false;
-  const element = component({
-    useMenuOpenState: () => [true, (next) => (closed = next === false)],
-    openConsole: face.openConsole,
-    t,
-  });
-  element.props.onSelect();
-  assert.equal(closed, true);
-  const page = byName("main")[0];
-  assert.equal(page.meta.inject().pendingTarget, "", "空 id 打开时不应带父会话");
-});
-
 /** 把渲染产物里所有文本拼起来。 */
 function textOf(node) {
   if (node === null || node === undefined) return "";
@@ -326,52 +223,20 @@ function textOf(node) {
   if (Array.isArray(node)) return node.map(textOf).join("");
   return textOf(node.props?.children);
 }
-
-check("主页面：无快照时给出说明，且带调度台表单", () => {
-  const text = textOf(byName("main")[0].component({ t, spawnChild: async () => {}, useForm: () => undefined }));
-  assert.match(text, /Vibe Bridge/);
-  assert.match(text, /已激活/);
-  assert.match(text, /调度台/);
-  assert.match(text, /父会话 id/);
-  assert.match(text, /创建子会话/);
-  assert.match(text, /取不到配置快照/);
-});
-
-check("主页面：带会话树区块，且 face 暴露 listSessions / sendToSession", () => {
-  const face = byName("main")[0].meta.inject();
-  assert.equal(typeof face.listSessions, "function");
-  assert.equal(typeof face.sendToSession, "function");
-  const text = textOf(byName("main")[0].component({ t, useForm: () => undefined, ...face }));
-  assert.match(text, /会话树/);
-});
-
-check("主页面：有规则时逐条列出", () => {
-  const text = textOf(
-    byName("main")[0].component({
-      t,
-      spawnChild: async () => {},
-      useForm: () => ({ value: { rules: [{ name: "verify", everyTurns: 4, fullEveryTurns: 12, fromTurn: 1, toTurn: 0 }] } }),
-    }),
-  );
-  assert.match(text, /verify/);
-  assert.match(text, /turn 1\.\.∞/);
-});
-
-check("主页面：预置父会话 id 会填进输入框", () => {
-  const page = byName("main")[0];
-  const element = page.component({ t, spawnChild: async () => {}, pendingTarget: "session-xyz", useForm: () => undefined });
-  const texts = JSON.stringify(element);
-  assert.ok(texts.includes("session-xyz"), "预置父会话 id 应出现在渲染树里");
-});
-
-// ---------------------------------------------------------------------------
-// C：可编辑设置卡片 + 会话菜单里的按会话开关
-// ---------------------------------------------------------------------------
-const cardEntry = registered.find((entry) => entry.meta.name === "plugins.item" && entry.meta.id === "vibe-bridge");
-const cardFace = cardEntry.meta.inject();
-/** 渲染卡片：hooks 与动作都在 face 里。 */
-const renderCard = (extra = {}) => cardEntry.component({ t, ...cardFace.hooks, ...cardFace, ...extra });
-/** 在渲染树里找所有满足条件的节点。 */
+/** 在渲染树里找第一个满足条件的节点。 */
+const find = (node, predicate) => {
+  if (node === null || typeof node !== "object") return undefined;
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const hit = find(child, predicate);
+      if (hit !== undefined) return hit;
+    }
+    return undefined;
+  }
+  if (predicate(node)) return node;
+  return find(node.props?.children, predicate);
+};
+/** 收集所有满足条件的节点。 */
 const collect = (node, predicate, out = []) => {
   if (node === null || typeof node !== "object") return out;
   if (Array.isArray(node)) {
@@ -383,83 +248,252 @@ const collect = (node, predicate, out = []) => {
   return out;
 };
 
-check("C1 设置卡片：五个数字/布尔字段 + 多行文案 + 保存/放弃", () => {
-  const rendered = renderCard();
-  assert.equal(rendered.type === "div", true, "卡片根节点应为容器");
-  const form = collect(rendered, (node) => node.type === "SettingsForm");
-  assert.equal(form.length, 1, "应渲染一个 SettingsForm");
-  assert.equal(typeof form[0].props.onSave, "function");
-  assert.equal(typeof form[0].props.onDiscard, "function");
-  const fields = collect(rendered, (node) => node.type === "SettingsValueField");
-  assert.equal(fields.length, 5, `应有 5 个 SettingsValueField（3 数字 + 2 布尔），实际 ${fields.length}`);
-  const ids = fields.map((field) => field.props.id).join(",");
-  for (const key of ["everyTurns", "fullEveryTurns", "fromTurn", "skipSubagentSessions", "speakOnFirstSeen"]) {
-    assert.ok(ids.includes(`vibe-bridge-${key}`), `缺少字段 ${key}`);
+await check("注册了六个面", () => {
+  assert.equal(registered.length, 6, JSON.stringify(registered.map((entry) => entry.meta.id)));
+  assert.deepEqual([...new Set(injectedSlots)].sort(), [
+    "main",
+    "plugins.item",
+    "shell.overlay",
+    "sidebar.panellist",
+    "sidebar.workspaces.session.menu.item",
+  ]);
+});
+
+await check("左侧栏入口与主页面 key 正确", () => {
+  assert.equal(byName("sidebar.panellist")[0].meta.id, "vibe-bridge");
+  assert.equal(byName("main")[0].meta.key, "vibe-bridge");
+});
+
+// ---------------------------------------------------------------------------
+// 会话右键菜单：只剩「碎碎念编辑」
+// ---------------------------------------------------------------------------
+await check("菜单只剩一项「碎碎念编辑」，旧的创建/调度台/开关项已删除", () => {
+  const items = byName("sidebar.workspaces.session.menu.item");
+  assert.equal(items.length, 1);
+  assert.equal(items[0].meta.id, "vibe-nudge-edit");
+  for (const removed of ["vibe-create-child", "vibe-console", "vibe-nudge-off", "vibe-nudge-reset"]) {
+    assert.equal(byId(removed), undefined, `${removed} 不应再注册`);
   }
-  assert.equal(fields.filter((field) => field.props.numeric === true).length, 3, "三个节奏字段应是数字框");
-  assert.ok(collect(rendered, (node) => node.type === "textarea").length === 1, "文案应是一个多行输入框");
 });
 
-check("C2 保存/放弃：绑到表单模型的 actions，dirty 决定可用态", () => {
-  const model = models.at(-1);
-  const clean = cardFace.hooks.useVibeBridgeCard((value) => value);
-  assert.equal(clean.dirty, false, "未编辑时 dirty=false");
-  cardFace.edit("everyTurns", "6");
-  const dirty = cardFace.hooks.useVibeBridgeCard((value) => value);
-  assert.equal(dirty.dirty, true, "编辑后 dirty=true");
-  assert.equal(dirty.everyTurns.text, "6", "受控输入应反映 staged 值");
-  const rendered = renderCard();
-  const form = collect(rendered, (node) => node.type === "SettingsForm")[0];
-  assert.equal(form.props.state.dirty, true, "SettingsForm 拿到的 state 应是 dirty");
-  form.props.onSave();
-  assert.equal(model.saved, 1, "点击保存应调用模型的 save()");
-  cardFace.discard();
-  assert.equal(model.staged.size, 0, "放弃应清空 staged");
-});
-
-{
-  // 摘要：先刷一次 `/vibe-nudge status`，再渲染卡片看“当前生效”。
-  await cardFace.refreshNudgeStatus();
-  check("C3 摘要区：渲染当前生效节奏与被覆盖会话数", () => {
-    const text = textOf(renderCard());
-    assert.match(text, /当前生效/);
-    assert.match(text, /节奏/);
-    assert.match(text, /every 4 · full every 12 · from turn 1/);
-    assert.match(text, /被单独覆盖的会话: 2/);
-    const statusCall = commands.find((call) => call.line === "/vibe-nudge status");
-    assert.ok(statusCall !== undefined, "摘要应通过宿主命令读取");
-    assert.equal(statusCall.sessionId, "session-anchor", "用一个会话作锚点");
-    assert.deepEqual(statusCall.attachments, []);
+await check("点击「碎碎念编辑」打开弹窗并关闭菜单", () => {
+  const { component, meta } = byId("vibe-nudge-edit");
+  const face = meta.inject();
+  let closed = false;
+  const element = component({
+    sessionId: "session-abcdef1234",
+    useMenuOpenState: () => [true, (next) => (closed = next === false)],
+    openNudgeEditor: face.openNudgeEditor,
+    t,
   });
-}
+  assert.equal(element.type, "MenuItemButton");
+  assert.equal(element.props.children, "碎碎念编辑");
+  element.props.onSelect();
+  assert.equal(closed, true, "点完应关闭菜单");
+});
 
-check("C4 菜单项「本会话关闭/恢复全局」：点击走 /vibe-nudge 命令", () => {
-  for (const [id, line] of [
-    ["vibe-nudge-off", "/vibe-nudge off"],
-    ["vibe-nudge-reset", "/vibe-nudge on"],
-  ]) {
-    const entry = byId(id);
-    const face = entry.meta.inject();
-    let closed = false;
-    const element = entry.component({
-      sessionId: "session-row-1",
-      useMenuOpenState: () => [true, (next) => (closed = next === false)],
-      nudgeCommand: face.nudgeCommand,
-      t,
-    });
-    assert.equal(element.type, "MenuItemButton");
-    element.props.onSelect();
-    assert.equal(closed, true, "点完应关闭菜单");
-  }
-  const nudgeCalls = commands.filter((call) => call.line === "/vibe-nudge off" || call.line === "/vibe-nudge on");
+// ---------------------------------------------------------------------------
+// 碎碎念编辑弹窗
+// ---------------------------------------------------------------------------
+const nudgeOverlay = registered.find((entry) => entry.meta.id === "vibe-bridge-nudge-dialog");
+const nudgeFace = nudgeOverlay.meta.inject();
+const renderDialog = () => nudgeOverlay.component({ t, ...nudgeFace });
+
+await check("弹窗：标题含会话 id 前 8 位，且带说明与关闭按钮", () => {
+  const rendered = renderDialog();
+  assert.ok(rendered, "编辑弹窗应渲染");
+  const text = textOf(rendered);
+  assert.match(text, /碎碎念 · session-/, "标题应是 碎碎念 · id 前 8 位");
+  assert.match(text, /仅作用于本次对话；子会话同样适用。/);
+  const closeBtn = find(rendered, (node) => node.type === "button" && node.props?.["aria-label"] === "关闭");
+  assert.ok(closeBtn !== undefined, "右上角应有关闭按钮");
+});
+
+await check("弹窗：关闭 / 打开 分别发 /vibe-nudge off 与 on", async () => {
+  const before = commands.length;
+  const rendered = renderDialog();
+  const offBtn = find(rendered, (node) => node.type === "button" && node.props?.["data-action"] === "off");
+  offBtn.props.onClick();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const onBtn = find(renderDialog(), (node) => node.type === "button" && node.props?.["data-action"] === "open");
+  onBtn.props.onClick();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const nudgeCalls = commands.slice(before).filter((call) => call.line === "/vibe-nudge off" || call.line === "/vibe-nudge on");
   assert.deepEqual(
     nudgeCalls.map((call) => [call.sessionId, call.line]),
     [
-      ["session-row-1", "/vibe-nudge off"],
-      ["session-row-1", "/vibe-nudge on"],
+      ["session-abcdef1234", "/vibe-nudge off"],
+      ["session-abcdef1234", "/vibe-nudge on"],
     ],
   );
   assert.deepEqual(nudgeCalls[0].attachments, []);
 });
+
+// 编辑：展开 → 保存（base64）
+await check("弹窗：编辑展开多行输入，保存走 /vibe-nudge text:<base64>", async () => {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const editFace = nudgeOverlay.meta.inject();
+  find(nudgeOverlay.component({ t, ...editFace }), (node) => node.type === "button" && node.props?.["data-action"] === "edit").props.onClick();
+  const expanded = renderDialog();
+  const area = find(expanded, (node) => node.type === "textarea");
+  assert.ok(area !== undefined, "「编辑」应展开多行输入");
+  assert.equal(area.props.placeholder, "留空 = 使用全局文案");
+  area.props.onChange({ target: { value: "自定义提醒" } });
+  const before = commands.length;
+  find(renderDialog(), (node) => node.type === "button" && node.props?.["data-action"] === "save-text").props.onClick();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const call = commands.slice(before).find((entry) => entry.line.startsWith("/vibe-nudge text:"));
+  assert.ok(call !== undefined, "应发出 text: 命令");
+  const expected = Buffer.from("自定义提醒", "utf8").toString("base64");
+  assert.equal(call.line, `/vibe-nudge text:${expected}`);
+  assert.equal(call.sessionId, "session-abcdef1234");
+});
+
+await check("弹窗：预填解析 session: 行（mode + 解码后的文案）", async () => {
+  const custom = Buffer.from("本会话文案", "utf8").toString("base64");
+  const original = ctx.remote.commands.execute;
+  ctx.remote.commands.execute = async (sessionId, line, attachments) => {
+    if (line === "/vibe-nudge status") {
+      commands.push({ sessionId, line, attachments });
+      return { ok: true, value: { result: { kind: "success", text: `overrides: 1\nsession: mode=off text=${custom}` } } };
+    }
+    return original(sessionId, line, attachments);
+  };
+  const parsed = await nudgeFace.nudgeLoad("session-abcdef1234");
+  ctx.remote.commands.execute = original;
+  assert.deepEqual(parsed, { mode: "off", text: "本会话文案" });
+  const text = textOf(renderDialog());
+  assert.match(text, /生效：已关闭/);
+  assert.match(text, /文案：本会话文案/);
+});
+
+// ---------------------------------------------------------------------------
+// 面板新布局
+// ---------------------------------------------------------------------------
+const pageEntry = byName("main")[0];
+const pageFace = pageEntry.meta.inject();
+const pageProps = {
+  t,
+  useForm: pageFace.hooks?.useForm,
+  openSpawn: pageFace.openSpawn,
+  listSessions: pageFace.listSessions,
+  sendToSession: pageFace.sendToSession,
+  pendingTarget: pageFace.pendingTarget,
+  // 直接喂数据，避免依赖 useEffect 拉列表
+  sessions: SAMPLE_SESSIONS,
+};
+
+await check("面板：用法并入描述（一行一句），不再有独立「用法」区块", () => {
+  const text = textOf(pageEntry.component({ ...pageProps }));
+  assert.match(text, /spawn_session\(prompt, label\) → session id/);
+  assert.match(text, /list_sessions\(\) → id \/ label \/ 运行状态/);
+  assert.match(text, /post_to_session\(session_id, message\) → message id/);
+  assert.match(text, /vibe_bridge_status 可看版本与注入次数/);
+  assert.equal(text.match(/用法/g)?.length ?? 0, 0, "不应再有「用法」小节");
+});
+
+await check("面板：父对话与子对话展示（父 id8 + 子 id8 + 任务描述）", () => {
+  const text = textOf(pageEntry.component({ ...pageProps }));
+  assert.match(text, /父对话及?其?子对话|父对话及其子对话/);
+  assert.match(text, /父对话 session- · 父对话标题/);
+  assert.match(text, /子会话 child-aa · 甲 · 给 A 模块补测试/);
+  assert.match(text, /子会话 child-bb · 乙 · 分析日志/);
+});
+
+await check("面板：「创建子会话」在会话树区块，点击打开 VibeSpawnDialog", () => {
+  const opens = [];
+  const element = pageEntry.component({ ...pageProps, openSpawn: (parentId) => opens.push(parentId) });
+  const button = find(element, (node) => node.type === "button" && node.props?.["data-action"] === "create-child");
+  assert.ok(button !== undefined, "树头应有创建按钮");
+  assert.equal(button.props.children, "创建子会话");
+  button.props.onClick();
+  assert.deepEqual(opens, ["session-parent-1"], "以第一个父会话为默认父会话");
+  // 不再有父会话 id / 任务的输入框
+  assert.equal(find(element, (node) => node.type === "textarea"), undefined, "调度台表单应已移除");
+});
+
+await check("面板：碎碎念规则逐会话列出（已关闭 / 每 N 轮）", () => {
+  const rows = [
+    { kind: "parent", sessionId: "session-parent-1", mode: "global", custom: false, every: 4 },
+    { kind: "child", sessionId: "child-aaaa-1111", mode: "off", custom: false, every: 4 },
+    { kind: "child", sessionId: "child-bbbb-2222", mode: "every:3", custom: true, every: 3 },
+  ];
+  const text = textOf(pageEntry.component({ ...pageProps, nudgeRows: rows, nudgeGlobalEvery: 4 }));
+  assert.match(text, /父对话 session- · 每 4 轮（全局文案）/);
+  assert.match(text, /子会话 child-aa · 已关闭/);
+  assert.match(text, /子会话 child-bb · 每 3 轮（本会话文案）/);
+});
+
+await check("面板：不再出现 cordis.patch.yml 与整块兜底文案", () => {
+  const text = textOf(pageEntry.component({ ...pageProps }));
+  assert.doesNotMatch(text, /cordis\.patch\.yml/);
+  assert.doesNotMatch(text, /Host 没有响应/);
+  assert.doesNotMatch(text, /取不到（Host/);
+});
+
+await check("面板：批量状态解析（status all）→ 无覆盖会话显示「跟随全局」", async () => {
+  const rows = await pageFace.refreshNudgeRows([
+    { kind: "parent", sessionId: "session-parent-1" },
+    { kind: "child", sessionId: "child-aaaa-1111" },
+    { kind: "child", sessionId: "child-bbbb-2222" },
+  ]);
+  assert.equal(pageFace.nudgeGlobalEvery(), 4);
+  assert.deepEqual(
+    rows.map((row) => [row.sessionId, row.mode, row.custom, row.every]),
+    [
+      ["session-parent-1", "global", false, 4],
+      ["child-aaaa-1111", "off", false, 4],
+      ["child-bbbb-2222", "every:3", true, 3],
+    ],
+  );
+  const text = textOf(pageEntry.component({ ...pageProps, nudgeRows: rows, nudgeGlobalEvery: 4 }));
+  assert.match(text, /父对话 session- · 每 4 轮（全局文案）/, "没有覆盖的会话应显示跟随全局");
+  const call = commands.find((entry) => entry.line === "/vibe-nudge status all");
+  assert.ok(call !== undefined, "应只发一次批量命令");
+});
+
+// ---------------------------------------------------------------------------
+// 设置卡片（保持不变）
+// ---------------------------------------------------------------------------
+const cardEntry = registered.find((entry) => entry.meta.name === "plugins.item" && entry.meta.id === "vibe-bridge");
+const cardFace = cardEntry.meta.inject();
+
+await check("设置卡片：注册在 plugins.item 上（不再是只读行）", () => {
+  assert.equal(cardEntry.meta.order, 40);
+  assert.equal(cardEntry.meta.label(), "碎碎念节奏");
+  assert.equal(byId("vibe-bridge-status"), undefined, "有表单模型时不该再注册只读行");
+});
+
+await check("设置卡片：五个数字/布尔字段 + 多行文案 + 保存/放弃", () => {
+  const rendered = cardEntry.component({ t, ...cardFace.hooks, ...cardFace });
+  const form = collect(rendered, (node) => node.type === "SettingsForm");
+  assert.equal(form.length, 1);
+  assert.equal(typeof form[0].props.onSave, "function");
+  assert.equal(typeof form[0].props.onDiscard, "function");
+  const fields = collect(rendered, (node) => node.type === "SettingsValueField");
+  assert.equal(fields.length, 5);
+  assert.ok(collect(rendered, (node) => node.type === "textarea").length === 1);
+});
+
+await check("设置卡片：dirty 后保存调用 actions().save()", () => {
+  const model = models.at(-1);
+  cardFace.edit("everyTurns", "6");
+  const dirty = cardFace.hooks.useVibeBridgeCard((value) => value);
+  assert.equal(dirty.dirty, true);
+  assert.equal(dirty.everyTurns.text, "6");
+  const rendered = cardEntry.component({ t, ...cardFace.hooks, ...cardFace });
+  find(rendered, (node) => node.type === "SettingsForm").props.onSave();
+  assert.equal(model.saved, 1);
+});
+
+{
+  await cardFace.refreshNudgeStatus();
+  await check("设置卡片摘要：显示当前节奏与覆盖数", () => {
+    const text = textOf(cardEntry.component({ t, ...cardFace.hooks, ...cardFace }));
+    assert.match(text, /当前生效/);
+    assert.match(text, /every 4 · full every 12 · from turn 1/);
+    assert.match(text, /被单独覆盖的会话: 2/);
+  });
+}
 
 console.log(results.join("\n"));
