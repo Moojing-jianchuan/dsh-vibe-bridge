@@ -88,11 +88,18 @@ The plugin reads its config from the profile's `cordis.patch.yml`:
         wakeDebounceMs: 800      # merge children that finish within this window into one notice
         persistWakeState: true   # survive restarts
         announceChildId: true    # tell the child its own session id
+        # top-level cadence scalars — these are what the settings card edits
+        everyTurns: 4
+        fullEveryTurns: 12
+        fromTurn: 1
+        skipSubagentSessions: true
+        speakOnFirstSeen: true
+        nudgeText: ''            # empty = fall back to rule.file / bundled nudge.md
         rules:
           - name: verify
             file: '/abs/path/to/nudge.md'   # re-read every turn, so edits apply immediately
-            everyTurns: 4                   # sparse reminder cadence
-            fullEveryTurns: 12              # full text cadence
+            everyTurns: 4                   # sparse reminder cadence (wins over the scalar)
+            fullEveryTurns: 12              # full text cadence (wins over the scalar)
             fromTurn: 1
             skipSubagentSessions: true
             speakOnFirstSeen: true
@@ -102,12 +109,21 @@ The plugin reads its config from the profile's `cordis.patch.yml`:
 |---|---|---|
 | `rules[].text` / `rules[].file` | — | inline text or a path re-read per turn |
 | `rules[].sparseText` | first N lines | what the sparse cadence sends |
-| `rules[].everyTurns` / `fullEveryTurns` | 1 / 0 | cadence; `0` disables the full pass |
+| `rules[].everyTurns` / `fullEveryTurns` | *(inherit the scalar)* | cadence; `0` disables the full pass |
+| `everyTurns` / `fullEveryTurns` / `fromTurn` | 4 / 12 / 1 | **top-level cadence scalars**: used by any rule that does not write that field (the settings card edits exactly these) |
+| `skipSubagentSessions` / `speakOnFirstSeen` | `true` / `true` | top-level defaults for the same rule fields |
+| `nudgeText` | `""` | global full text; empty = `rule.file` → `rule.text` (and the bundled `nudge.md` when `rules` is empty) |
 | `wakeDebounceMs` | 800 | batch window for completion notices |
 | `persistWakeState` | `true` | write `wake-state.json` and compensate on restart |
 | `enableSpawn` / `enableQuery` / `enablePost` / `enableList` / `enableStop` | `true` | per-tool switches |
 | `enableInbox` | `true` | register `get_session_inbox` |
+| `enableNudgeControl` | `true` | register `nudge_control` and the `/vibe-nudge` command |
 | `enableCrossParent` | `true` | allow `post_to_session({ cross_parent: true })` (the session-controller fallback) |
+
+Priority for every cadence field is **rule field > top-level scalar > built-in default**. Two compatibility rules worth knowing:
+
+- a rule that writes a window (`toTurn > 0`, or a `fromTurn` other than 1) but no cadence keeps the historical "every turn inside the window" behaviour (1 / 5), so old configs do not change;
+- `rules: []` stays tools-only unless you set `nudgeText` or change any top-level scalar — then the plugin synthesises one implicit rule named `nudge`.
 
 ## Tools
 
@@ -119,9 +135,25 @@ The plugin reads its config from the profile's `cordis.patch.yml`:
 | `query_session(session_id, tail?, include_tools?, verbose?)` | header + the last `tail` rounds, including an `[inject]` section for messages other sessions injected; `verbose` adds model/provider/workdir and longer excerpts |
 | `get_session_inbox(session_id)` | what is still queued in another session's inbox: `{position, target, source_kind, sender_session_id?, queued_at, preview}` |
 | `stop_session(session_id)` | interrupts a direct child only |
-| `vibe_bridge_status()` | live status, rule list, injected count **and injected characters** |
+| `nudge_control(session_id, mode)` | per-session nudge switch: `off` / `sparse` / `full` / `every:N` / `clear` (or `on` = clear); returns `{session_id, mode, source: 'session' \| 'global'}` and survives restarts |
+| `vibe_bridge_status()` | live status, rule list, injected count **and injected characters**, plus `overridesCount` and up to five `session → mode` overrides |
 
 The host command `/vibe-spawn <label>|<task>` backs the UI's *Create child session* action, so creating a child never costs a parent model turn.
+
+### Settings card and per-session switches
+
+- **Settings → Plugins → Vibe Bridge** shows an editable card built on `SettingsFormModel`: cadence (`everyTurns`,
+  `fullEveryTurns`, `fromTurn`), the global `nudgeText`, and the two booleans (`skipSubagentSessions`,
+  `speakOnFirstSeen`) with Save / Discard. The plugin only registers that card while the Host serves its settings
+  namespace (`configForms.whileServed`); on an older Host it falls back to the read-only status row.
+- Booleans are **text fields** (`true` / `false`, empty = default): the only field primitive the Host ships is a text
+  input, so there is no toggle control to use.
+- Below the form sits a read-only summary: the effective cadence and how many sessions have their own override. The
+  client cannot read `nudges.json`, so the count comes from the host command `/vibe-nudge status` (issued against the
+  first session as an anchor); when that answer is missing the line says "unavailable" instead of guessing.
+- **Right-click a session → “碎碎念：本会话关闭” / “碎碎念：本会话恢复全局”** send `/vibe-nudge off` and
+  `/vibe-nudge on` through `ctx.remote.commands.execute(session, line, [])`. Both items also appear on child-session
+  rows, and a failure is swallowed so a missing host command can never break the context menu.
 
 ## Delivery visibility: injects, three states, who-may-message-whom, notices, workspace scope
 
@@ -268,6 +300,37 @@ a1f82c62-… [inactive] (top-level) — 重建工作区  ·  D:\ds_work  ·  --D
 (after a restart, or for sessions of another process) — that is a fact about the registry, not about the session.
 Rows from your own workspace come first, then newest first. This is also how you discover an id to use with
 `post_to_session({ cross_parent: true })`.
+
+### 6. Per-session nudges (`nudges.json`)
+
+The cadence is global; a single session can opt out (or get a different rhythm) without touching the configuration:
+
+```jsonc
+// $DSH_HOME/vibe-bridge/nudges.json — written atomically, read on every pre-step (mtime-cached)
+{ "session-abc": { "mode": "off", "updatedAt": "2026-11-25T04:57:39.052Z" } }
+```
+
+| `mode` | Effect for that session |
+|---|---|
+| `off` | no nudges at all |
+| `sparse` | only on turns the global cadence classifies as sparse |
+| `full` | every turn, full text |
+| `every:N` | turns 1, 1+N, 1+2N… with the full text |
+| *(no entry)* | the global rules |
+
+Precedence is **session override > `rules[]` > top-level scalars > defaults**. A `full` / `every:N` override takes its
+text from the first rule (or `nudgeText`, or the bundled `nudge.md` when there is no rule), and the child-done notices
+are unaffected by it.
+
+Three ways to set it — all of them land in the same file, so they survive a restart:
+
+- `nudge_control(session_id, mode)` (model tool),
+- `/vibe-nudge [off|on|sparse|full|every:N|clear]` (no argument toggles `off` ↔ global), plus `/vibe-nudge status` for
+  a read-only summary of the effective cadence and the current overrides,
+- the session context menu (the two items described above).
+
+A broken or unreadable `nudges.json` is treated as an empty table (one `warn` in the log, never an exception inside
+`agent/pre-step`), so a hand-edited file cannot wedge a turn.
 
 ## What it costs in context
 

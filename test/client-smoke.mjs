@@ -35,10 +35,67 @@ const reactStub = {
   useState: (initial) => [typeof initial === "function" ? initial() : initial, () => {}],
   useEffect: () => {},
 };
+/** 表单模型桩：形状与真实 SettingsFormModel 一致（field/shell/actions/bind/plan/dispose）。 */
+const models = [];
+class SettingsFormModelStub {
+  constructor(scope, specs) {
+    this.scope = scope;
+    this.specs = new Map(specs.map((spec) => [spec.field, spec]));
+    this.staged = new Map();
+    this.saved = 0;
+    this.disposed = false;
+    models.push(this);
+  }
+  field(name) {
+    const spec = this.specs.get(name);
+    const staged = this.staged.get(name);
+    return {
+      text: staged !== undefined ? staged : spec.format(this.scope?.value?.[name]),
+      overridden: false,
+      invalid: false,
+    };
+  }
+  shell() {
+    return { available: true, writable: true, dirty: this.staged.size > 0, invalid: false, saving: false, failed: false };
+  }
+  actions() {
+    return {
+      edit: (field, text) => this.staged.set(field, text),
+      resetField: (field) => this.staged.delete(field),
+      save: () => {
+        this.saved += 1;
+        this.staged.clear();
+      },
+      discard: () => this.staged.clear(),
+    };
+  }
+  bind(projection) {
+    return () => projection();
+  }
+  plan() {
+    return [...this.staged.keys()].map((key) => ({ op: "set", path: [key] }));
+  }
+  dispose() {
+    this.disposed = true;
+  }
+}
 const primitivesStub = {
   MenuItemButton: "MenuItemButton",
   IconPlusOutlineRegular: "IconPlus",
   IconCordisPluginOutlineRegular: "IconCordis",
+  SettingsFormModel: SettingsFormModelStub,
+  SettingsForm: "SettingsForm",
+  SettingsValueField: "SettingsValueField",
+  settingsNumberField: (field) => ({
+    field,
+    format: (value) => (typeof value === "number" ? String(value) : ""),
+    parse: (text) => (text.trim() === "" ? { kind: "clear" } : Number.isFinite(Number(text)) ? { kind: "set", value: Number(text) } : undefined),
+  }),
+  settingsTextField: (field) => ({
+    field,
+    format: (value) => (typeof value === "string" ? value : ""),
+    parse: (text) => (text.trim() === "" ? { kind: "clear" } : { kind: "set", value: text }),
+  }),
 };
 const moduleTable = {
   "react/jsx-runtime": jsxRuntime,
@@ -72,17 +129,26 @@ const injectedSlots = [];
 const panels = [];
 const prompts = [];
 const commands = [];
-const fakeForm = { value: undefined, getSnapshot: () => fakeForm };
+const fakeForm = { value: { everyTurns: 4, fullEveryTurns: 12, fromTurn: 1, nudgeText: "" }, getSnapshot: () => fakeForm };
+const statusText = "every 4 · full every 12 · from turn 1\nrules: nudge every 4/full 12\noverrides: 2 (session-a → off, session-b → every:3)";
 const ctx = {
   effect: (fn) => {
     const dispose = fn();
     return () => dispose?.();
   },
-  locale: { register: (key, dicts) => locales.push({ key, dicts }) },
-  configForms: { get: (namespace) => ({ ...fakeForm, namespace }) },
+  locale: {
+    register: (key, dicts) => locales.push({ key, dicts }),
+    bind: (key) => (text) => (locales.find((entry) => entry.key === key)?.dicts.zh ?? {})[text] ?? text,
+  },
+  configForms: {
+    get: (namespace) => ({ ...fakeForm, namespace }),
+    // 真实服务在命名空间被服务时回调；桩里直接当作“已服务”。
+    whileServed: (namespaces, register) => register(new Set(namespaces)),
+  },
   layout: { selectPanel: (id) => panels.push(id) },
   remote: {
     session: {
+      list: async () => ({ items: [{ sessionId: "session-anchor" }] }),
       prompt: async (request) => {
         prompts.push(request);
         return { messageId: "msg-1" };
@@ -91,6 +157,12 @@ const ctx = {
     commands: {
       execute: async (sessionId, line, attachments) => {
         commands.push({ sessionId, line, attachments });
+        if (line === "/vibe-nudge status") {
+          return { ok: true, value: { result: { kind: "success", text: statusText } } };
+        }
+        if (line.startsWith("/vibe-nudge")) {
+          return { ok: true, value: { result: { kind: "success", text: "本会话碎碎念：ok" } } };
+        }
         return { ok: true, value: { result: { kind: "success", text: "session started: child-from-command" } } };
       },
     },
@@ -119,11 +191,11 @@ const byId = (id) => registered.find((entry) => entry.meta.id === id);
 const dict = locales[0].dicts.zh;
 const t = (key) => dict[key];
 
-check("注册了六个面", () => {
-  assert.equal(registered.length, 6);
+check("注册了八个面（含可编辑设置卡片）", () => {
+  assert.equal(registered.length, 8);
   assert.deepEqual([...new Set(injectedSlots)].sort(), [
     "main",
-    "settings.general.item",
+    "plugins.item",
     "shell.overlay",
     "sidebar.panellist",
     "sidebar.workspaces.session.menu.item",
@@ -143,17 +215,23 @@ check("主页面：key 与入口 id 一致", () => {
   assert.equal(meta.locale, "vibeBridge");
 });
 
-check("设置行：id/order 正确", () => {
-  const { meta } = byId("vibe-bridge-status");
-  assert.equal(meta.order, 88);
+check("设置卡片：注册在 plugins.item 上（不再是只读行）", () => {
+  const { meta } = registered.find((entry) => entry.meta.name === "plugins.item" && entry.meta.id === "vibe-bridge");
+  assert.equal(meta.name, "plugins.item");
+  assert.equal(meta.order, 40);
+  assert.equal(meta.label(), "碎碎念节奏");
+  assert.equal(byId("vibe-bridge-status"), undefined, "有表单模型时不该再注册只读行");
 });
 
-check("会话菜单：两个菜单项 id/order 正确", () => {
+check("会话菜单：四个菜单项 id/order 正确", () => {
   const create = byId("vibe-create-child");
-  const console = byId("vibe-console");
-  assert.equal(create.meta.name, "sidebar.workspaces.session.menu.item");
-  assert.equal(create.meta.order, 460);
-  assert.equal(console.meta.order, 461);
+  const consoleItem = byId("vibe-console");
+  const off = byId("vibe-nudge-off");
+  const reset = byId("vibe-nudge-reset");
+  for (const item of [create, consoleItem, off, reset]) {
+    assert.equal(item.meta.name, "sidebar.workspaces.session.menu.item");
+  }
+  assert.deepEqual([create.meta.order, consoleItem.meta.order, off.meta.order, reset.meta.order], [460, 461, 462, 463]);
 });
 
 check("菜单项「创建子会话」打开弹窗并关闭菜单", () => {
@@ -286,10 +364,102 @@ check("主页面：预置父会话 id 会填进输入框", () => {
   assert.ok(texts.includes("session-xyz"), "预置父会话 id 应出现在渲染树里");
 });
 
-check("设置行：标题 + 已激活徽标", () => {
-  const text = textOf(byId("vibe-bridge-status").component({ t, useForm: () => undefined }));
-  assert.match(text, /Vibe Bridge/);
-  assert.match(text, /已激活/);
+// ---------------------------------------------------------------------------
+// C：可编辑设置卡片 + 会话菜单里的按会话开关
+// ---------------------------------------------------------------------------
+const cardEntry = registered.find((entry) => entry.meta.name === "plugins.item" && entry.meta.id === "vibe-bridge");
+const cardFace = cardEntry.meta.inject();
+/** 渲染卡片：hooks 与动作都在 face 里。 */
+const renderCard = (extra = {}) => cardEntry.component({ t, ...cardFace.hooks, ...cardFace, ...extra });
+/** 在渲染树里找所有满足条件的节点。 */
+const collect = (node, predicate, out = []) => {
+  if (node === null || typeof node !== "object") return out;
+  if (Array.isArray(node)) {
+    for (const child of node) collect(child, predicate, out);
+    return out;
+  }
+  if (predicate(node)) out.push(node);
+  collect(node.props?.children, predicate, out);
+  return out;
+};
+
+check("C1 设置卡片：五个数字/布尔字段 + 多行文案 + 保存/放弃", () => {
+  const rendered = renderCard();
+  assert.equal(rendered.type === "div", true, "卡片根节点应为容器");
+  const form = collect(rendered, (node) => node.type === "SettingsForm");
+  assert.equal(form.length, 1, "应渲染一个 SettingsForm");
+  assert.equal(typeof form[0].props.onSave, "function");
+  assert.equal(typeof form[0].props.onDiscard, "function");
+  const fields = collect(rendered, (node) => node.type === "SettingsValueField");
+  assert.equal(fields.length, 5, `应有 5 个 SettingsValueField（3 数字 + 2 布尔），实际 ${fields.length}`);
+  const ids = fields.map((field) => field.props.id).join(",");
+  for (const key of ["everyTurns", "fullEveryTurns", "fromTurn", "skipSubagentSessions", "speakOnFirstSeen"]) {
+    assert.ok(ids.includes(`vibe-bridge-${key}`), `缺少字段 ${key}`);
+  }
+  assert.equal(fields.filter((field) => field.props.numeric === true).length, 3, "三个节奏字段应是数字框");
+  assert.ok(collect(rendered, (node) => node.type === "textarea").length === 1, "文案应是一个多行输入框");
+});
+
+check("C2 保存/放弃：绑到表单模型的 actions，dirty 决定可用态", () => {
+  const model = models.at(-1);
+  const clean = cardFace.hooks.useVibeBridgeCard((value) => value);
+  assert.equal(clean.dirty, false, "未编辑时 dirty=false");
+  cardFace.edit("everyTurns", "6");
+  const dirty = cardFace.hooks.useVibeBridgeCard((value) => value);
+  assert.equal(dirty.dirty, true, "编辑后 dirty=true");
+  assert.equal(dirty.everyTurns.text, "6", "受控输入应反映 staged 值");
+  const rendered = renderCard();
+  const form = collect(rendered, (node) => node.type === "SettingsForm")[0];
+  assert.equal(form.props.state.dirty, true, "SettingsForm 拿到的 state 应是 dirty");
+  form.props.onSave();
+  assert.equal(model.saved, 1, "点击保存应调用模型的 save()");
+  cardFace.discard();
+  assert.equal(model.staged.size, 0, "放弃应清空 staged");
+});
+
+{
+  // 摘要：先刷一次 `/vibe-nudge status`，再渲染卡片看“当前生效”。
+  await cardFace.refreshNudgeStatus();
+  check("C3 摘要区：渲染当前生效节奏与被覆盖会话数", () => {
+    const text = textOf(renderCard());
+    assert.match(text, /当前生效/);
+    assert.match(text, /节奏/);
+    assert.match(text, /every 4 · full every 12 · from turn 1/);
+    assert.match(text, /被单独覆盖的会话: 2/);
+    const statusCall = commands.find((call) => call.line === "/vibe-nudge status");
+    assert.ok(statusCall !== undefined, "摘要应通过宿主命令读取");
+    assert.equal(statusCall.sessionId, "session-anchor", "用一个会话作锚点");
+    assert.deepEqual(statusCall.attachments, []);
+  });
+}
+
+check("C4 菜单项「本会话关闭/恢复全局」：点击走 /vibe-nudge 命令", () => {
+  for (const [id, line] of [
+    ["vibe-nudge-off", "/vibe-nudge off"],
+    ["vibe-nudge-reset", "/vibe-nudge on"],
+  ]) {
+    const entry = byId(id);
+    const face = entry.meta.inject();
+    let closed = false;
+    const element = entry.component({
+      sessionId: "session-row-1",
+      useMenuOpenState: () => [true, (next) => (closed = next === false)],
+      nudgeCommand: face.nudgeCommand,
+      t,
+    });
+    assert.equal(element.type, "MenuItemButton");
+    element.props.onSelect();
+    assert.equal(closed, true, "点完应关闭菜单");
+  }
+  const nudgeCalls = commands.filter((call) => call.line === "/vibe-nudge off" || call.line === "/vibe-nudge on");
+  assert.deepEqual(
+    nudgeCalls.map((call) => [call.sessionId, call.line]),
+    [
+      ["session-row-1", "/vibe-nudge off"],
+      ["session-row-1", "/vibe-nudge on"],
+    ],
+  );
+  assert.deepEqual(nudgeCalls[0].attachments, []);
 });
 
 console.log(results.join("\n"));

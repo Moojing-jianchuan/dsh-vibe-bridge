@@ -7,7 +7,7 @@
  * 运行：node test/smoke.mjs
  */
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { zstdCompressSync } from "node:zlib";
@@ -145,11 +145,12 @@ check("Config 归一化：默认值补齐", () => {
 
 const { preStep, tools, activations, messages, interrupted, commands } = makeCtx(config);
 
-check("注册了 1 个中间件 + 7 个工具", () => {
+check("注册了 1 个中间件 + 8 个工具", () => {
   assert.equal(preStep.length, 1);
   assert.deepEqual([...tools.keys()].sort(), [
     "get_session_inbox",
     "list_sessions",
+    "nudge_control",
     "post_to_session",
     "query_session",
     "spawn_session",
@@ -1116,10 +1117,174 @@ const notifyCheck = async () => {
   console.log(results.slice(firstNew).join("\n"));
 };
 
+// ---------------------------------------------------------------------------
+// A：节奏提升为顶层标量（规则内字段 > 顶层标量 > 内置默认）
+// ---------------------------------------------------------------------------
+const scheduleCheck = async () => {
+  const firstNew = results.length;
+  /** 跑若干轮，返回每轮有没有注入，以及每轮注入的正文。 */
+  const patternOf = async (ctx, turns) => {
+    const pattern = [];
+    const texts = new Map();
+    for (const turn of turns) {
+      const decision = await step(ctx.preStep[0], { turn });
+      const injected = decision.messages.filter((message) => message.source?.kind === name);
+      pattern.push(injected.length > 0);
+      texts.set(turn, injected.map((message) => message.content.map((part) => part.text).join("")).join(""));
+    }
+    return { pattern, texts };
+  };
+  const base = { enabled: true, provider: "spawn", persistWakeState: false };
+
+  const scalarCtx = makeCtx(
+    Config({ ...base, rules: [], everyTurns: 2, fullEveryTurns: 4, fromTurn: 1, speakOnFirstSeen: false }),
+  );
+  await checkAsync("A1 只给顶层标量（rules:[]）→ everyTurns=2 决定节奏（1/3/5 命中，2/4 不命中）", async () => {
+    const { pattern, texts } = await patternOf(scalarCtx, [1, 2, 3, 4, 5]);
+    assert.deepEqual(pattern, [true, false, true, false, true]);
+    assert.match(texts.get(1), /\[SYSTEM REMINDER:nudge\]/, "隐式规则的标记名应为 nudge");
+  });
+
+  const overrideCtx = makeCtx(
+    Config({ ...base, rules: [{ name: "r", text: "MARK-RULE", everyTurns: 1 }], everyTurns: 2, speakOnFirstSeen: false }),
+  );
+  await checkAsync("A2 规则内 everyTurns=1 覆盖顶层 everyTurns=2 → 每轮都注入", async () => {
+    const { pattern } = await patternOf(overrideCtx, [1, 2, 3]);
+    assert.deepEqual(pattern, [true, true, true]);
+  });
+
+  const legacyCtx = makeCtx(
+    Config({ ...base, rules: [{ name: "legacy", text: "LEGACY-TEXT", everyTurns: 4, fullEveryTurns: 12 }] }),
+  );
+  await checkAsync("A3 老配置（规则内 everyTurns=4/fullEveryTurns=12，无顶层键）行为不变", async () => {
+    const { pattern, texts } = await patternOf(legacyCtx, [1, 2, 3, 4, 5]);
+    assert.deepEqual(pattern, [true, false, false, false, true]);
+    assert.match(texts.get(1), /LEGACY-TEXT/);
+    assert.match(texts.get(1), /\[SYSTEM REMINDER:legacy\]/);
+  });
+
+  console.log(results.slice(firstNew).join("\n"));
+};
+
+// ---------------------------------------------------------------------------
+// B：按会话注入（nudges.json > rules[] > 顶层标量 > 默认）
+// ---------------------------------------------------------------------------
+const sessionNudgeCheck = async () => {
+  const firstNew = results.length;
+  const baseConfig = {
+    enabled: true,
+    provider: "spawn",
+    persistWakeState: false,
+    rules: [],
+    nudgeText: "MARK-SESSION",
+    everyTurns: 2,
+    fullEveryTurns: 4,
+    speakOnFirstSeen: false,
+  };
+  // 全局节奏（everyTurns=2, fromTurn=1）：第 1、3、5 轮命中。
+  const ctx = makeCtx(Config(baseConfig));
+  const control = () => ctx.tools.get("nudge_control");
+  const nudgesPath = path.join(TEST_HOME, "vibe-bridge", "nudges.json");
+  /** 某个会话的某一轮有没有注入。 */
+  const injectedAt = async (target, sessionId, turn) => {
+    const decision = await step(target.preStep[0], { turn, agent: { id: sessionId, session: { id: sessionId } } });
+    return decision.messages.filter((message) => message.source?.kind === name).length > 0;
+  };
+
+  const off = await control().execute({ session_id: "session-off", mode: "off" }, {});
+  const everyOne = await control().execute({ session_id: "session-every", mode: "every:1" }, {});
+
+  await checkAsync("B1 off：该会话零注入，其它会话不受影响", async () => {
+    assert.equal(off.mode, "off");
+    assert.equal(off.source, "session");
+    assert.equal(await injectedAt(ctx, "session-off", 1), false);
+    assert.equal(await injectedAt(ctx, "session-off", 3), false);
+    assert.equal(await injectedAt(ctx, "session-other", 1), true, "其它会话仍按全局节奏");
+  });
+
+  await checkAsync("B2 every:1：该会话每轮都注入（全局第 2 轮本来不注入）", async () => {
+    assert.equal(everyOne.mode, "every:1");
+    assert.equal(everyOne.source, "session");
+    assert.equal(await injectedAt(ctx, "session-every", 2), true);
+    assert.equal(await injectedAt(ctx, "session-every", 3), true);
+  });
+
+  await checkAsync("B3 clear：删除覆盖、回落全局（第 5 轮命中），返回 source:'global'", async () => {
+    const cleared = await control().execute({ session_id: "session-every", mode: "clear" }, {});
+    assert.equal(cleared.source, "global");
+    assert.equal(cleared.mode, "global");
+    // 第 4 轮全局不命中、第 5 轮命中 —— 证明真的回到了全局节奏
+    assert.equal(await injectedAt(ctx, "session-every", 4), false);
+    assert.equal(await injectedAt(ctx, "session-every", 5), true);
+  });
+
+  await checkAsync("B4 重新 apply（模拟重启）后覆盖仍生效（读盘）", async () => {
+    await control().execute({ session_id: "session-persist", mode: "off" }, {});
+    const restarted = makeCtx(Config(baseConfig));
+    assert.equal(await injectedAt(restarted, "session-persist", 1), false, "重启后覆盖应仍生效");
+    assert.equal(await injectedAt(restarted, "session-persist-other", 1), true);
+    // 状态文件形状符合约定：{ "<sessionId>": { mode, updatedAt } }
+    const parsed = JSON.parse(readFileSync(nudgesPath, "utf8"));
+    assert.equal(parsed["session-persist"].mode, "off");
+    assert.match(parsed["session-persist"].updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  await checkAsync("B5 非法 mode 抛错且不写盘", async () => {
+    const before = readFileSync(nudgesPath, "utf8");
+    await assert.rejects(control().execute({ session_id: "session-off", mode: "bogus" }, {}), /invalid mode/);
+    await assert.rejects(control().execute({ session_id: "session-off", mode: "every:0" }, {}), /invalid mode/);
+    assert.equal(readFileSync(nudgesPath, "utf8"), before, "非法调用不该改动状态文件");
+    // 顺手校验输出契约
+    const value = await control().execute({ session_id: "session-off", mode: "full" }, {});
+    assertOutputContract(ctx.tools, "nudge_control", value);
+  });
+
+  await checkAsync("B6 坏 JSON：视作空表，pre-step 不抛错", async () => {
+    writeFileSync(nudgesPath, "{ this is not json", "utf8");
+    const broken = makeCtx(Config(baseConfig));
+    assert.equal(await injectedAt(broken, "session-off", 1), true, "坏表等于没有覆盖，应回到全局节奏");
+  });
+
+  await checkAsync("B7 /vibe-nudge：无参在 off↔全局之间切换，带参设置模式", async () => {
+    const readState = () => JSON.parse(readFileSync(nudgesPath, "utf8"));
+    // 坏 JSON 之后文件是坏的，先让工具重建一份干净的表。
+    await control().execute({ session_id: "session-cmd", mode: "clear" }, {});
+    const command = ctx.commands.find((definition) => definition.name === "vibe-nudge");
+    assert.ok(command !== undefined, "应注册 /vibe-nudge 命令");
+    const first = await command.handler({ agent: { id: "session-cmd" }, rawInput: "" });
+    assert.equal(first.kind, "success");
+    assert.match(first.text, /关闭/);
+    assert.equal(readState()["session-cmd"].mode, "off");
+    const second = await command.handler({ agent: { id: "session-cmd" }, rawInput: "" });
+    assert.match(second.text, /恢复全局/);
+    assert.equal(readState()["session-cmd"], undefined, "再次切换应删掉覆盖");
+    const third = await command.handler({ agent: { id: "session-cmd" }, rawInput: "every:3" });
+    assert.equal(third.kind, "success");
+    assert.equal(readState()["session-cmd"].mode, "every:3");
+    const bogus = await command.handler({ agent: { id: "session-cmd" }, rawInput: "nonsense" });
+    assert.equal(bogus.kind, "error");
+  });
+
+  await checkAsync("B8 /vibe-nudge status：回传当前节奏 + 覆盖数（给设置页读）", async () => {
+    const command = ctx.commands.find((definition) => definition.name === "vibe-nudge");
+    const status = await command.handler({ agent: { id: "session-cmd" }, rawInput: "status" });
+    assert.equal(status.kind, "success");
+    assert.match(status.text, /every 2 · full every 4 · from turn 1/);
+    assert.match(status.text, /skip subagent on/);
+    assert.match(status.text, /rules: /);
+    assert.match(status.text, /overrides: \d+/);
+    assert.match(status.text, /session-cmd → every:3/, "覆盖条目应逐条列出");
+  });
+
+  console.log(results.slice(firstNew).join("\n"));
+};
+
 run()
   .then(wakeCheck)
   .then(deliveryCheck)
   .then(notifyCheck)
+  .then(scheduleCheck)
+  .then(sessionNudgeCheck)
   .then(() => {
     const failed = results.filter((line) => line.startsWith("FAIL"));
     console.log("");

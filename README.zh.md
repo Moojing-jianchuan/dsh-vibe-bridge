@@ -89,11 +89,18 @@ Windows 上依赖联接用的是目录 junction，不需要管理员权限、也
         wakeDebounceMs: 800      # 这个窗口内收工的多个子会话合并成一条通知
         persistWakeState: true   # 重启后仍记得在跑的子会话
         announceChildId: true    # 告诉子会话它自己的 id
+        # 顶层节奏标量：设置页编辑的就是这几个键
+        everyTurns: 4
+        fullEveryTurns: 12
+        fromTurn: 1
+        skipSubagentSessions: true
+        speakOnFirstSeen: true
+        nudgeText: ''            # 空 = 回落 rule.file / 包内 nudge.md
         rules:
           - name: verify
             file: '/abs/path/to/nudge.md'   # 每轮重读，改完即时生效
-            everyTurns: 4                   # 稀疏提醒的节奏
-            fullEveryTurns: 12              # 全量文案的节奏
+            everyTurns: 4                   # 稀疏提醒的节奏（优先于顶层标量）
+            fullEveryTurns: 12              # 全量文案的节奏（优先于顶层标量）
             fromTurn: 1
             skipSubagentSessions: true
             speakOnFirstSeen: true
@@ -103,12 +110,21 @@ Windows 上依赖联接用的是目录 junction，不需要管理员权限、也
 |---|---|---|
 | `rules[].text` / `rules[].file` | — | 内联文本，或每轮重读的文件路径 |
 | `rules[].sparseText` | 取全文前 N 行 | 稀疏节奏发的文案 |
-| `rules[].everyTurns` / `fullEveryTurns` | 1 / 0 | 节奏；`0` 表示不发全量 |
+| `rules[].everyTurns` / `fullEveryTurns` | （继承顶层标量） | 节奏；`0` 表示不发全量 |
+| `everyTurns` / `fullEveryTurns` / `fromTurn` | 4 / 12 / 1 | **顶层节奏标量**：规则没写该字段时用它（设置页编辑的正是这些） |
+| `skipSubagentSessions` / `speakOnFirstSeen` | `true` / `true` | 同名字段的顶层默认值 |
+| `nudgeText` | `""` | 全局全量文案；空 = `rule.file` → `rule.text`（无 rules 时再回落包内 `nudge.md`） |
 | `wakeDebounceMs` | 800 | 完成通知的合并窗口 |
 | `persistWakeState` | `true` | 写 `wake-state.json` 并在启动时补偿 |
 | `enableSpawn` / `enableQuery` / `enablePost` / `enableList` / `enableStop` | `true` | 逐工具开关 |
 | `enableInbox` | `true` | 注册 `get_session_inbox` |
+| `enableNudgeControl` | `true` | 注册 `nudge_control` 与 `/vibe-nudge` 命令 |
 | `enableCrossParent` | `true` | 放行 `post_to_session({ cross_parent: true })`（走 sessionController 绕行） |
+
+节奏字段的优先级统一是 **规则内字段 > 顶层标量 > 内置默认**，另有两条兼容规则：
+
+- 规则带了窗口（`toTurn > 0`，或 `fromTurn` 不是 1）却没写节奏时，沿用历史行为「窗内每轮」（1 / 5），老配置一字不变；
+- `rules: []` 仍然是「仅工具」，除非你设置了 `nudgeText` 或改过任一顶层标量 —— 那时插件会合成一条名为 `nudge` 的隐式规则。
 
 ## 工具
 
@@ -120,9 +136,17 @@ Windows 上依赖联接用的是目录 junction，不需要管理员权限、也
 | `query_session(session_id, tail?, include_tools?, verbose?)` | 头部信息 + 最近 `tail` 轮；新增 `[inject]` 段显示别的会话注入的消息；`verbose` 才给模型/供应商/工作目录与更长的正文 |
 | `get_session_inbox(session_id)` | 别的会话还没被消费的队列：`{position, target, source_kind, sender_session_id?, queued_at, preview}` |
 | `stop_session(session_id)` | 只停自己的直接子会话 |
-| `vibe_bridge_status()` | 在线状态、规则列表、已注入次数**与字符数** |
+| `nudge_control(session_id, mode)` | 按会话开关碎碎念：`off` / `sparse` / `full` / `every:N` / `clear`（`on` = clear）；返回 `{session_id, mode, source: 'session' \| 'global'}`，重启后仍生效 |
+| `vibe_bridge_status()` | 在线状态、规则列表、已注入次数**与字符数**，外加 `overridesCount` 与最多五条 `会话 → mode` 覆盖 |
 
 宿主命令 `/vibe-spawn <名字>|<任务>` 就是界面里「创建子会话」背后的那条路径 —— 所以建子会话不消耗父会话的任何模型轮次。
+
+### 设置卡片与会话开关
+
+- **设置 → 插件 → Vibe Bridge** 是一张可编辑卡片：节奏（`everyTurns`、`fullEveryTurns`、`fromTurn`）、全局 `nudgeText`、以及两个布尔项（`skipSubagentSessions`、`speakOnFirstSeen`），带保存/放弃。卡片只在宿主服务本插件命名空间时注册（`configForms.whileServed`）；老版本宿主上退回只读状态行。
+- 布尔项用的是**文本框**（`true` / `false`，留空=默认）：宿主提供的字段原语只有文本输入，没有开关控件，所以这是当前唯一的做法。
+- 表单下方是只读摘要：当前生效节奏 + 有多少会话被单独覆盖。客户端读不了 `nudges.json`，所以覆盖数来自宿主命令 `/vibe-nudge status`（拿第一个会话做锚点）；拿不到就写“取不到”，不猜。
+- **右键会话 →「碎碎念：本会话关闭」/「本会话恢复全局」** 分别发 `/vibe-nudge off` 与 `/vibe-nudge on`（走 `ctx.remote.commands.execute(会话, 命令, [])`）。子会话行同样有这两项；失败静默，旧宿主没有该命令也不会把右键菜单弄崩。
 
 ## 投递可见性：注入段、三态、谁能给谁发、通知来源、workspace 列表
 
@@ -227,6 +251,33 @@ a1f82c62-… [inactive] (top-level) — 重建工作区  ·  D:\ds_work  ·  --D
 
 `status` 在 Agent 仍注册于 `ctx.agents` 时是 `running` / `inactive`，否则是 `not-loaded`（重启后、或属于别的进程）—— 这描述的是注册表事实，不是会话本身状态。
 自己所在 workspace 的行排在最前，其次新的在前。要拿「不是自己子会话」的 id 去跨父投递，就用这个列表查。
+
+### 6. 按会话注入（`nudges.json`）
+
+节奏是全局的；单个会话可以单独关掉或换节奏，不用改配置：
+
+```jsonc
+// $DSH_HOME/vibe-bridge/nudges.json —— 原子写；每次 pre-step 读（按 mtime 缓存）
+{ "session-abc": { "mode": "off", "updatedAt": "2026-11-25T04:57:39.052Z" } }
+```
+
+| `mode` | 对该会话的效果 |
+|---|---|
+| `off` | 完全不注入 |
+| `sparse` | 只在全局判定为「稀疏」的轮次注入 |
+| `full` | 每轮注入全量文案 |
+| `every:N` | 第 1、1+N、1+2N… 轮注入全量文案 |
+| *（无条目）* | 按全局规则 |
+
+优先级：**会话覆盖 > `rules[]` > 顶层标量 > 默认**。`full` / `every:N` 的文案取自第一条规则（或 `nudgeText`，没有规则时回落包内 `nudge.md`）；子会话完成通知不受它影响。
+
+三个入口写的是同一个文件，所以重启后依然生效：
+
+- `nudge_control(session_id, mode)`（模型工具）；
+- `/vibe-nudge [off|on|sparse|full|every:N|clear]`（无参 = 在 `off` ↔ 全局之间切换），另有 `/vibe-nudge status` 输出只读摘要（当前节奏 + 现有覆盖）；
+- 会话右键菜单的两项（见上）。
+
+`nudges.json` 坏掉或读不到时一律当空表处理（只记一次 `warn`，**绝不**让 `agent/pre-step` 抛错），所以手改成坏文件也不会卡住一轮。
 
 ## 上下文成本（实测）
 
