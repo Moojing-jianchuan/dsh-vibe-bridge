@@ -1252,16 +1252,17 @@ const sessionNudgeCheck = async () => {
     assert.equal(JSON.parse(readFileSync(nudgesPath, "utf8"))["session-toggle"], undefined);
   });
 
-  await checkAsync("B8 /vibe-nudge status：cadence / rules / overrides / session / 会话规则 / tip", async () => {
+  await checkAsync("B8 /vibe-nudge status：只报仍生效的项 + overrides / session / 会话规则 / tip", async () => {
     const command = ctx.commands.find((definition) => definition.name === "vibe-nudge");
     const out = await command.handler({ agent: { id: "session-b8" }, rawInput: "status" });
     const lines = out.text.split("\n");
-    assert.match(lines[0], /^every \d+ · full every \d+ · from turn \d+/);
-    assert.match(lines[1], /^rules: /);
-    assert.match(lines[2], /^overrides: \d+/);
-    assert.match(lines[3], /^session: mode=\S+ text=\S+$/);
-    assert.match(lines[4], /^会话规则：\d+ 条/);
-    assert.match(lines.at(-1), /^tip: 无参第一次/);
+    // 全局节奏行已随全局模型删除：状态里不该再出现 "every N · full every M · from turn"。
+    assert.doesNotMatch(out.text, /full every \d+/, "不该再打印已废弃的全局节奏");
+    assert.match(lines[0], /^skip subagent (on|off) · speak on first seen (on|off)$/);
+    assert.match(lines[1], /^overrides: \d+/);
+    assert.match(lines[2], /^session: mode=\S+ text=\S+$/);
+    assert.match(lines[3], /^会话规则：\d+ 条/);
+    assert.match(lines.at(-1), /^tip: 「暂停」/);
   });
 
   console.log(results.slice(firstNew).join("\n"));
@@ -1567,7 +1568,8 @@ const rulesCheck = async () => {
     const text = tool.output.render({}, value).map((part) => part.text).join("\n");
     assert.match(text, /会话规则：2 条/);
     assert.match(text, /constraint \/ every-message \/ /);
-    assert.match(text, /preference \/ every-n \/ /);
+    // 策略必须带 N：只写 every-n 会让人以为每轮都注入（用户就是因此以为自检没生效）。
+    assert.match(text, /preference \/ every-n\(\d+\) \/ /);
     assert.match(text, /disabled/);
   });
 
