@@ -94,7 +94,7 @@ The plugin reads its config from the profile's `cordis.patch.yml`:
         fromTurn: 1
         skipSubagentSessions: true
         speakOnFirstSeen: true
-        nudgeEnabled: true       # global on/off for reminders only (not the whole plugin)
+        nudgeEnabled: true       # deprecated: reminders are session-only, injection ignores this key
         nudgeText: ''            # empty = fall back to rule.file / bundled nudge.md
         rules:
           - name: verify
@@ -114,7 +114,7 @@ The plugin reads its config from the profile's `cordis.patch.yml`:
 | `everyTurns` / `fullEveryTurns` / `fromTurn` | 4 / 12 / 1 | **top-level cadence scalars**: used by any rule that does not write that field (the settings card edits exactly these) |
 | `skipSubagentSessions` / `speakOnFirstSeen` | `true` / `true` | top-level defaults for the same rule fields |
 | `nudgeText` | `""` | global full text; empty = `rule.file` → `rule.text` (and the bundled `nudge.md` when `rules` is empty) |
-| `nudgeEnabled` | `true` | master switch for **reminders only**; `false` short-circuits before any session override (nothing is injected, `full`/`every:1` included) |
+| `nudgeEnabled` | `true` | **deprecated**: kept so old configs keep loading, the injection path no longer reads it (reminders are session-only now) |
 | `wakeDebounceMs` | 800 | batch window for completion notices |
 | `persistWakeState` | `true` | write `wake-state.json` and compensate on restart |
 | `enableSpawn` / `enableQuery` / `enablePost` / `enableList` / `enableStop` | `true` | per-tool switches |
@@ -154,28 +154,24 @@ The sidebar entry (`Vibe Bridge`) opens the panel, top to bottom:
 3. **Session tree** with the *Create child session* button in its header (it opens the same `VibeSpawnDialog`,
    pre-filled with the first parent session) plus *Refresh*; every child row keeps its message box and *Send*.
 4. **What this plugin adds** — one text block instead of three cards.
-5. **Reminder rules in effect**, first line `全局：开启（每 4 轮）` / `全局：已关闭`, then one line per conversation,
-   built from a single `/vibe-nudge status all` call:
-   `父对话 a1b2c3d4 · 每 4 轮（全局文案）`, `子会话 e5f6a7b8 · 已关闭`, `子会话 … · 每 3 轮（本会话文案）`.
-   A conversation that has no override shows the global cadence with "全局文案"; when the global switch is off every
-   row is suffixed `（全局关闭）` so a single-session setting cannot be mistaken for the cause. Nothing here reads or
-   prints `cordis.patch.yml`.
+5. **Reminder rules in effect**, one line per conversation, built from a single `/vibe-nudge status all` call:
+   `父对话 a1b2c3d4 · 3 条规则`, `子会话 e5f6a7b8 · 已关闭`, `子会话 … · 本会话未配置规则（不会注入）`.
+   Reminders are **session-only**: there is no global switch row any more. Nothing here reads or prints
+   `cordis.patch.yml`.
 
 **Right-click any session → 「碎碎念编辑」** (child rows included) opens a dialog scoped to that conversation:
 
-- title `碎碎念 · <id8>`, a read-only status line (`生效：全局 / 已关闭 / 稀疏 / 全量 / 每 N 轮 · 文案：全局/本会话`);
-  while the global switch is off it reads `生效：全局已关闭（本会话设置不生效）`,
+- title `碎碎念 · <id8>`, a read-only status line that only reports **this session** (`生效：全局 / 已关闭 / 稀疏 / 全量 / 每 N 轮`
+  plus the custom-text source),
 - **打开** = `/vibe-nudge on` (back to the global rules), **关闭** = `/vibe-nudge off`, **编辑** = a textarea
   pre-filled with that session's own text (empty = "use the global text") with **保存 / 取消** — saving sends
   `/vibe-nudge text:<base64>`, saving an empty box clears the custom text,
 - **设置轮次**: `每 [N] 轮` + **应用** (`/vibe-nudge every:N`, N must be a whole number ≥ 1 — otherwise the box turns red
   and nothing is sent), plus the **稀疏** (`sparse`) and **全量** (`full`) shortcuts,
-- **全局**: `全局：开启/已关闭` + **全局关闭 / 全局开启**. This writes `nudgeEnabled` through the **settings form model**
-  (`edit` + `save`), i.e. exactly the same path as the settings card — the client never edits the config file itself,
 - the line `仅作用于本次对话；子会话同样适用。`, a ✕ button, and overlay-click / Esc to close.
 
-Everything the panel and the dialog change goes through `ctx.remote.commands.execute(session, line, [])` (session
-settings) or the settings form model (the global switch); the client never reads or writes `nudges.json` itself.
+Everything the panel and the dialog change goes through `ctx.remote.commands.execute(session, line, [])`; the client
+never reads or writes `nudges.json` / `rules.json` itself.
 
 ### Settings card
 
@@ -355,8 +351,9 @@ Each session can carry its **own rule list** in `$DSH_HOME/vibe-bridge/rules.jso
 }
 ```
 
-Priority: `nudgeEnabled=false` (plugin config) → `nudges.json mode:"off"` → **this session's rules** → the old global
-`rules[]` path. When a session has at least one enabled rule, only that list is injected (the global rules are not
+Priority: `nudges.json mode:"off"` (whole-session switch) → **this session's rules** → the legacy `nudges.json text`
+(read-only virtual rule). **There is no global injection any more**: a session without rules injects nothing, and
+`nudgeEnabled` is deprecated (the key is still accepted, the injection path no longer reads it). When a session has at least one enabled rule, only that list is injected (the global rules are not
 added on top). Every hit is merged into **one** block per turn:
 
 ```
@@ -370,6 +367,21 @@ Strategies: `every-message` = every turn, `every-n` = turns 1, 1+N, 1+2N…, `fi
 (judged by the process marker plus the session log, so a restart does not repeat it). If the same rule would send the
 same text as last time, only the generic one-liner is sent (`按「…」的规则自检一遍（内容同上一轮，未重复）。`), so the
 194-character reminder is not re-sent every turn.
+
+**Adding the bundled default.** The packaged `nudge.md` is no longer injected automatically; the panel and the dialog
+have an explicit **添加默认规则 / Add default rule** button that turns it into one `every-message` rule of the session
+(`/vibe-nudge default-rule`), and the write still goes through `rules.json`.
+
+**Dialog layout (U1–U5/F1).** The dialog shows the session's rule list first (index · type tag · first 40 chars ·
+strategy summary · enable switch · edit · delete, empty state "还没有规则"), then the type capsules; the content
+textarea and the strategy pills are **collapsed by default** and expand when you click a type (clicking the same type
+again collapses). The global switch sits at the **bottom**, between the editor and the single footer line, which now
+carries both the validation hint and "仅作用于本次对话；子会话同样适用。". The status line never repeats that hint
+(a red line below does), so it reads `生效：全局已关闭`.
+
+**Status output.** `vibe_bridge_status` reports `会话规则：N 条` (or `会话规则：0 条（不会注入）`) plus up to five
+`type / strategy / first 20 chars / enabled|disabled` lines; `/vibe-nudge status` and `status all` carry the same
+information, and the panel shows `本会话未配置规则（不会注入）` for a session without rules.
 
 **Backward compatibility (read-only).** A legacy `nudges.json` entry with `text` is interpreted at runtime as a
 **virtual rule** and is never written anywhere: `mode: every:N` → `every-n`+N, `full` → `every-message`, anything

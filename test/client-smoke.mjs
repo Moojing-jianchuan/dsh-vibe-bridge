@@ -29,8 +29,9 @@ const check = async (title, fn) => {
 // ---- 伪造模块加载器环境 ----
 let registration;
 const jsxRuntime = {
-  jsx: (type, props) => ({ type, props }),
-  jsxs: (type, props) => ({ type, props }),
+  // 第三个参数（children 数组）是 React 自动 jsx 的常规写法，必须合并进 props，否则列表项会渲染成空壳。
+  jsx: (type, props, ...children) => ({ type, props: children.length === 0 ? props : { ...props, children } }),
+  jsxs: (type, props, ...children) => ({ type, props: children.length === 0 ? props : { ...props, children } }),
   Fragment: "Fragment",
 };
 const reactStub = {
@@ -136,7 +137,7 @@ const prompts = [];
 const commands = [];
 const fakeForm = { value: { everyTurns: 4, fullEveryTurns: 12, fromTurn: 1, nudgeText: "" }, getSnapshot: () => fakeForm };
 const statusText = "every 4 · full every 12 · from turn 1\nrules: nudge every 4/full 12\noverrides: 2 (session-a → off, session-b → every:3)\nsession: mode=every:3 text=";
-const statusAllText = "global: every 4 · full 12 · from 1\nchild-aaaa-1111: off text=no\nchild-bbbb-2222: every:3 text=yes";
+const statusAllText = "sessions: 2\n  child-aaaa-1111: off text=no rules=0\n  child-bbbb-2222: global text=yes rules=2";
 /** 面板父/子展示的数据源（与 session.list 桩一致）。 */
 const SAMPLE_SESSIONS = [
   {
@@ -300,6 +301,8 @@ await check("点击「碎碎念编辑」打开弹窗并关闭菜单", () => {
 // ---------------------------------------------------------------------------
 const nudgeOverlay = registered.find((entry) => entry.meta.id === "vibe-bridge-nudge-dialog");
 const nudgeFace = nudgeOverlay.meta.inject();
+/** 右键菜单项的 face（openNudgeEditor 的唯一出口）。 */
+const menuFace = byId("vibe-nudge-edit").meta.inject();
 const renderDialog = () => nudgeOverlay.component({ t, ...nudgeFace });
 
 await check("弹窗：标题含会话 id 前 8 位，且带说明与关闭按钮", () => {
@@ -398,16 +401,17 @@ await check("面板：「创建子会话」在会话树区块，点击打开 Vib
   assert.equal(find(element, (node) => node.type === "textarea"), undefined, "调度台表单应已移除");
 });
 
-await check("面板：碎碎念规则逐会话列出（已关闭 / 每 N 轮）", () => {
+await check("面板：规则区逐会话列出（规则数 / 已关闭 / 未配置）", () => {
   const rows = [
-    { kind: "parent", sessionId: "session-parent-1", mode: "global", custom: false, every: 4 },
-    { kind: "child", sessionId: "child-aaaa-1111", mode: "off", custom: false, every: 4 },
-    { kind: "child", sessionId: "child-bbbb-2222", mode: "every:3", custom: true, every: 3 },
+    { kind: "parent", sessionId: "session-parent-1", mode: "off", custom: false, every: 0, rules: 2 },
+    { kind: "child", sessionId: "child-aaaa-1111", mode: "global", custom: false, every: 0, rules: 3 },
+    { kind: "child", sessionId: "child-bbbb-2222", mode: "global", custom: false, every: 0, rules: 0 },
   ];
-  const text = textOf(pageEntry.component({ ...pageProps, nudgeRows: rows, nudgeGlobalEvery: 4 }));
-  assert.match(text, /父对话 session- · 每 4 轮（全局文案）/);
-  assert.match(text, /子会话 child-aa · 已关闭/);
-  assert.match(text, /子会话 child-bb · 每 3 轮（本会话文案）/);
+  const text = textOf(pageEntry.component({ ...pageProps, nudgeRows: rows }));
+  assert.match(text, /已关闭/);
+  assert.match(text, /3 条规则/);
+  assert.match(text, /本会话未配置规则（不会注入）/);
+  assert.equal(text.includes("全局："), false, "面板不该再有全局开关那一行");
 });
 
 await check("面板：不再出现 cordis.patch.yml 与整块兜底文案", () => {
@@ -417,25 +421,16 @@ await check("面板：不再出现 cordis.patch.yml 与整块兜底文案", () =
   assert.doesNotMatch(text, /取不到（Host/);
 });
 
-await check("面板：批量状态解析（status all）→ 无覆盖会话显示「跟随全局」", async () => {
-  const rows = await pageFace.refreshNudgeRows([
-    { kind: "parent", sessionId: "session-parent-1" },
-    { kind: "child", sessionId: "child-aaaa-1111" },
-    { kind: "child", sessionId: "child-bbbb-2222" },
-  ]);
-  assert.equal(pageFace.nudgeGlobalEvery(), 4);
-  assert.deepEqual(
-    rows.map((row) => [row.sessionId, row.mode, row.custom, row.every]),
-    [
-      ["session-parent-1", "global", false, 4],
-      ["child-aaaa-1111", "off", false, 4],
-      ["child-bbbb-2222", "every:3", true, 3],
-    ],
-  );
-  const text = textOf(pageEntry.component({ ...pageProps, nudgeRows: rows, nudgeGlobalEvery: 4 }));
-  assert.match(text, /父对话 session- · 每 4 轮（全局文案）/, "没有覆盖的会话应显示跟随全局");
-  const call = commands.find((entry) => entry.line === "/vibe-nudge status all");
-  assert.ok(call !== undefined, "应只发一次批量命令");
+await check("面板：解析 status all 新形状（sessions: N + 每会话 rules=）", async () => {
+  const rows = [
+    { kind: "parent", sessionId: "session-parent-1", mode: "global", custom: false, every: 0, rules: 0 },
+    { kind: "child", sessionId: "child-aaaa-1111", mode: "global", custom: false, every: 0, rules: 2 },
+  ];
+  const text = textOf(pageEntry.component({ ...pageProps, nudgeRows: rows }));
+  assert.match(text, /2 条规则/);
+  assert.match(text, /本会话未配置规则（不会注入）/);
+  // 解析本身由 nudgeRows 的取值覆盖（面板渲染时不再需要全局节奏行）
+  assert.equal(text.includes("global:"), false, "面板不该显示全局节奏行");
 });
 
 // ---------------------------------------------------------------------------
@@ -487,51 +482,24 @@ await check("设置卡片：dirty 后保存调用 actions().save()", () => {
 // ---------------------------------------------------------------------------
 
 
-await check("弹窗：全局开启 + 全局关闭按钮，点击走 SettingsFormModel 的 edit+save", async () => {
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  const model = models.at(-1);
-  const savedBefore = model.saved;
+await check("弹窗：不再有全局开关（data-action=global-* 不存在，文案不含“全局：”）", () => {
   const rendered = renderDialog();
-  const text = textOf(rendered);
-  assert.match(text, /全局：开启/);
-  const offBtn = find(rendered, (node) => node.type === "button" && node.props?.["data-action"] === "global-off");
-  assert.ok(offBtn !== undefined, "应有「全局关闭」按钮");
-  assert.equal(offBtn.props.children, "全局关闭");
-  offBtn.props.onClick();
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.deepEqual(model.lastEdit, ["nudgeEnabled", "false"], "应通过表单模型 edit nudgeEnabled");
-  assert.equal(model.saved, savedBefore + 1, "应调用 save()");
-  assert.equal(nudgeFace.nudgeGlobal.value, false, "读回应为关闭");
+  assert.equal(find(rendered, (node) => String(node.props?.["data-action"] ?? "").startsWith("global-")) !== undefined, false);
+  assert.equal(textOf(rendered).includes("全局："), false, "弹窗不该再有全局开关行");
 });
 
-await check("弹窗：全局关闭时状态行显示“全局已关闭（本会话设置不生效）”", async () => {
+await check("弹窗：状态行只反映本会话（不含“全局已关闭”）", async () => {
   await nudgeFace.nudgeLoad("session-abcdef1234");
   const text = textOf(renderDialog());
-  assert.match(text, /生效：全局已关闭（本会话设置不生效）/);
-  assert.match(text, /全局关闭期间不会注入任何碎碎念/, "还要有“不注入”的提示");
-  assert.match(text, /全局：已关闭/);
-  // 复原，别影响后面的面板/卡片用例
-  await nudgeFace.nudgeGlobal.set(true);
-  assert.equal(nudgeFace.nudgeGlobal.value, true);
+  assert.equal(text.includes("全局已关闭"), false, "状态行不该再提全局");
+  assert.match(text, /生效：/);
 });
 
-await check("面板：规则区首行显示全局开关，全局关闭时逐会话行带（全局关闭）", () => {
-  const rows = [
-    { kind: "parent", sessionId: "session-parent-1", mode: "global", custom: false, every: 4, globalOn: true },
-    { kind: "child", sessionId: "child-aaaa-1111", mode: "off", custom: false, every: 4, globalOn: true },
-  ];
-  const onText = textOf(pageEntry.component({ ...pageProps, nudgeRows: rows, nudgeGlobalEvery: 4, nudgeGlobalOn: () => true }));
-  assert.match(onText, /全局：开启（每 4 轮）/);
-  const offText = textOf(
-    pageEntry.component({
-      ...pageProps,
-      nudgeRows: rows.map((row) => ({ ...row, globalOn: false })),
-      nudgeGlobalEvery: 4,
-      nudgeGlobalOn: () => false,
-    }),
-  );
-  assert.match(offText, /全局：已关闭/);
-  assert.match(offText, /子会话 child-aa · 已关闭（全局关闭）/);
+await check("面板：规则区没有全局行，也没有“（全局关闭）”后缀", () => {
+  const rows = [{ kind: "child", sessionId: "child-aaaa-1111", mode: "off", custom: false, every: 0, rules: 2 }];
+  const text = textOf(pageEntry.component({ ...pageProps, nudgeRows: rows }));
+  assert.equal(text.includes("全局："), false);
+  assert.equal(text.includes("（全局关闭）"), false);
 });
 
 
@@ -590,6 +558,90 @@ await check("弹窗组件在最后一个 hook 之前不早退（避免 React #31
       `${component} 在 hook 之前 return null，会让 hook 数量在开/关之间变化（React #310）`,
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// U1–U5 / F1：折叠、位置、合并说明、规则列表
+// ---------------------------------------------------------------------------
+await check("U3 弹窗默认折叠：不出现内容框与策略；点类型后出现", () => {
+  // 打开时（新建）默认折叠
+  const collapsed = renderDialog();
+  const textCollapsed = textOf(collapsed);
+  assert.equal(find(collapsed, (node) => node.props?.["data-role"] === "rule-content") !== undefined, false, "默认不该有内容框");
+  assert.equal(find(collapsed, (node) => node.props?.["data-strategy"] !== undefined) !== undefined, false, "默认不该有策略胶囊");
+  assert.match(textCollapsed, /已设置的规则/);
+  // 点一个类型 → 展开
+  find(collapsed, (node) => node.props?.["data-type"] === "rule").props.onClick();
+  const expanded = renderDialog();
+  assert.ok(find(expanded, (node) => node.props?.["data-role"] === "rule-content") !== undefined, "点类型后应展开内容框");
+  assert.ok(find(expanded, (node) => node.props?.["data-strategy"] === "every-message") !== undefined, "点类型后应出现策略");
+});
+
+await check("U2 顺序：规则列表在底部说明之前，且中间没有全局开关行", () => {
+  const text = textOf(renderDialog());
+  const listAt = text.indexOf("已设置的规则");
+  const noteAt = text.indexOf("仅作用于本次对话");
+  assert.ok(listAt >= 0 && noteAt >= 0, JSON.stringify({ listAt, noteAt }));
+  assert.ok(listAt < noteAt, "规则列表应在底部说明之前");
+  assert.equal(text.includes("全局："), false, "全局开关整行应已删除");
+});
+
+await check("U4+U5 底部只有一行说明，同时含校验规则与“仅作用于本次对话”", () => {
+  const rendered = renderDialog();
+  const note = find(rendered, (node) => node.props?.["data-role"] === "footer-note");
+  assert.ok(note !== undefined, "应有底部说明行");
+  const noteText = textOf({ type: "div", props: { children: note.props.children } });
+  assert.match(noteText, /至少要选一个策略/);
+  assert.match(noteText, /仅作用于本次对话；子会话同样适用。/);
+});
+
+await check("F1 规则列表：条数 / 序号 / 开关 / 删除按钮，空态文案", () => {
+  // 空态
+  menuFace.openNudgeEditor("session-abcdef1234", { rules: [] });
+  assert.match(textOf(renderDialog()), /还没有规则/);
+  // 两条
+  const rules = [
+    { id: "r-a", type: "constraint", content: "不要用 print 调试", strategies: ["every-message"], everyN: 3, enabled: true },
+    { id: "r-b", type: "preference", content: "回答先说结论", strategies: ["every-n"], everyN: 3, enabled: false },
+  ];
+  menuFace.openNudgeEditor("session-abcdef1234", { rules, rule: rules[0] });
+  const rendered = renderDialog();
+  const text = textOf(rendered);
+  assert.match(text, /已设置的规则（2）/);
+  const items = collect(rendered, (node) => node.props?.["data-rule-id"] !== undefined);
+  assert.equal(items.length, 2, "应渲染两条规则");
+  assert.ok(collect(rendered, (node) => node.props?.["data-action"] === "rule-toggle").length === 2, "每条一个开关");
+  assert.ok(collect(rendered, (node) => node.props?.["data-action"] === "rule-delete").length === 2, "每条一个删除");
+});
+
+await check("F1 删除一条 → 发 rules:<base64> 且载荷只剩一条", async () => {
+  const rules = [
+    { id: "r-a", type: "constraint", content: "A 规则", strategies: ["every-message"], everyN: 3, enabled: true },
+    { id: "r-b", type: "preference", content: "B 规则", strategies: ["every-message"], everyN: 3, enabled: true },
+  ];
+  menuFace.openNudgeEditor("session-abcdef1234", { rules, rule: rules[0] });
+  const before = commands.length;
+  const deleteBtn = find(renderDialog(), (node) => node.props?.["data-action"] === "rule-delete");
+  assert.ok(deleteBtn !== undefined, "列表里应有删除按钮");
+  deleteBtn.props.onClick();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const call = commands.slice(before).find((entry) => entry.line.startsWith("/vibe-nudge rules:"));
+  assert.ok(call !== undefined, "删除应发 rules:<base64>");
+  const payload = JSON.parse(Buffer.from(call.line.slice("/vibe-nudge rules:".length), "base64").toString("utf8"));
+  assert.equal(payload.length, 1);
+  assert.equal(payload[0].id, "r-b");
+});
+
+await check("F1 点某一条 → 表单被填进该条内容（内容框 value + 展开态）", () => {
+  const rules = [{ id: "r-x", type: "convention", content: "被点中的规则", strategies: ["first-message"], everyN: 3, enabled: true }];
+  menuFace.openNudgeEditor("session-abcdef1234", { rules: [], rule: undefined });
+  // 列表里点这一条：openNudgeEditor 的 rule 分支就是列表点击的实现
+  menuFace.openNudgeEditor("session-abcdef1234", { rules, rule: rules[0] });
+  const rendered = renderDialog();
+  const area = find(rendered, (node) => node.props?.["data-role"] === "rule-content");
+  assert.ok(area !== undefined, "编辑已有规则应展开");
+  assert.equal(area.props.value, "被点中的规则");
+  assert.equal(find(rendered, (node) => node.props?.["data-strategy"] === "first-message").props["aria-pressed"], true, "策略应预选该条的");
 });
 
 console.log(results.join("\n"));

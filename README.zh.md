@@ -95,7 +95,7 @@ Windows 上依赖联接用的是目录 junction，不需要管理员权限、也
         fromTurn: 1
         skipSubagentSessions: true
         speakOnFirstSeen: true
-        nudgeEnabled: true       # 只关碎碎念的总开关（≠ 整插件 enabled）
+        nudgeEnabled: true       # deprecated：碎碎念只做会话级，注入侧不读这个键
         nudgeText: ''            # 空 = 回落 rule.file / 包内 nudge.md
         rules:
           - name: verify
@@ -115,7 +115,7 @@ Windows 上依赖联接用的是目录 junction，不需要管理员权限、也
 | `everyTurns` / `fullEveryTurns` / `fromTurn` | 4 / 12 / 1 | **顶层节奏标量**：规则没写该字段时用它（设置页编辑的正是这些） |
 | `skipSubagentSessions` / `speakOnFirstSeen` | `true` / `true` | 同名字段的顶层默认值 |
 | `nudgeText` | `""` | 全局全量文案；空 = `rule.file` → `rule.text`（无 rules 时再回落包内 `nudge.md`） |
-| `nudgeEnabled` | `true` | **只关碎碎念**的总开关；`false` 时在会话覆盖之前就短路（任何会话都不注入，`full`/`every:1` 也一样） |
+| `nudgeEnabled` | `true` | **deprecated**：保留只为老配置能加载，注入侧已不再读它（碎碎念现在只做会话级） |
 | `wakeDebounceMs` | 800 | 完成通知的合并窗口 |
 | `persistWakeState` | `true` | 写 `wake-state.json` 并在启动时补偿 |
 | `enableSpawn` / `enableQuery` / `enablePost` / `enableList` / `enableStop` | `true` | 逐工具开关 |
@@ -151,17 +151,16 @@ Windows 上依赖联接用的是目录 junction，不需要管理员权限、也
 2. **父对话及其子对话**（只读）：`父对话 <id8> · <标题>`，其下缩进每个子会话 `子会话 <id8> · <label> · <任务描述，截断 40 字>`；数据来自 `listSessions()` 与 `subagentCatalog` 投影。原「父会话 id / 任务」调度台表单已删除。
 3. **会话树**：树头放了「创建子会话」（打开的还是那个 `VibeSpawnDialog`，默认父会话取列表里第一个）和「刷新」；每行的 draft 输入 + 发送不变。
 4. **这个插件带来什么**：三张卡片改成一段文字。
-5. **碎碎念规则**：首行 `全局：开启（每 4 轮）` / `全局：已关闭`，其后逐会话列出实际生效配置，数据来自**一次** `/vibe-nudge status all` 调用 —— `父对话 a1b2c3d4 · 每 4 轮（全局文案）`、`子会话 e5f6a7b8 · 已关闭`、`子会话 … · 每 3 轮（本会话文案）`。没有覆盖的会话显示全局节奏 + “全局文案”；全局关闭时每行统一加 `（全局关闭）`，避免误以为是单会话设置坏了；这里不读也不显示 `cordis.patch.yml`。
+5. **碎碎念规则**：逐会话一行，数据来自一次 `/vibe-nudge status all` —— `父对话 a1b2c3d4 · 3 条规则`、`子会话 e5f6a7b8 · 已关闭`、`… · 本会话未配置规则（不会注入）`。碎碎念只做会话级，面板里没有全局开关行。
 
 **右键任一会话 →「碎碎念编辑」**（子会话行同样有）弹出只作用于该对话的弹窗：
 
-- 标题 `碎碎念 · <id8>`，只读状态行（`生效：全局 / 已关闭 / 稀疏 / 全量 / 每 N 轮 · 文案：全局/本会话`）；全局关闭时显示 `生效：全局已关闭（本会话设置不生效）`；
+- 标题 `碎碎念 · <id8>`，只读状态行只反映**本会话**（`生效：全局 / 已关闭 / 稀疏 / 全量 / 每 N 轮` + 文案来源）；
 - **打开** = `/vibe-nudge on`（回落全局），**关闭** = `/vibe-nudge off`，**编辑** 展开多行输入（预填该会话自定义文案，空 = “使用全局文案”），**保存 / 取消**；保存发 `/vibe-nudge text:<base64>`，留空保存 = 清除自定义文案；
 - **设置轮次**：`每 [N] 轮` + **应用**（发 `/vibe-nudge every:N`，N 必须是 ≥1 的整数，否则输入框标红且不发送），另有 **稀疏**（`sparse`）与 **全量**（`full`）两个快捷按钮；
-- **全局**：`全局：开启/已关闭` + **全局关闭 / 全局开启**。这一项走**设置表单模型**（`edit('nudgeEnabled', …)` + `save()`），与设置卡片同一条通道 —— 客户端从不自己改配置文件；
 - 弹窗里有一行 `仅作用于本次对话；子会话同样适用。`，右上角 ✕，点遮罩或按 Esc 也可关闭。
 
-面板与弹窗的会话级改动走 `ctx.remote.commands.execute(会话, 命令, [])`，全局开关走设置表单模型；客户端自身从不读写 `nudges.json`。
+面板与弹窗的一切改动都走 `ctx.remote.commands.execute(会话, 命令, [])`；客户端自身从不读写 `nudges.json` / `rules.json`。
 
 ### 设置卡片
 
@@ -287,7 +286,8 @@ a1f82c62-… [inactive] (top-level) — 重建工作区  ·  D:\ds_work  ·  --D
 }
 ```
 
-优先级：`nudgeEnabled=false`（插件配置）→ `nudges.json mode:"off"` → **本会话规则** → 旧的全局 `rules[]`。
+优先级：`nudges.json mode:"off"`（整会话开关）→ **本会话规则** → 旧 `nudges.json text`（只读虚拟规则）。
+**全局注入已砍掉**：没有规则的会话什么都不注入；`nudgeEnabled` 标记为 deprecated（键仍接受，注入侧不再读它）。
 会话有至少一条 enabled 规则时**只用它**（不再叠加全局规则）；每轮命中合并成**一段**：
 
 ```
@@ -300,6 +300,18 @@ a1f82c62-… [inactive] (top-level) — 重建工作区  ·  D:\ds_work  ·  --D
 策略：`every-message` 每轮、`every-n` 第 1、1+N、1+2N… 轮、`first-message` 每会话只一次（进程标记 + 会话日志双判据，
 重启不重复）。若同一条规则这轮要发的正文与上次完全相同，只发那句通用短句（`按「…」的规则自检一遍（内容同上一轮，未重复）。`），
 不会每轮重发 194 字全文。
+
+**添加默认规则**：包内 `nudge.md` 不再自动注入；面板与弹窗里有显式的 **添加默认规则** 按钮，把它变成该会话的一条
+`every-message` 规则（`/vibe-nudge default-rule`），落盘仍走 `rules.json`。
+
+**弹窗布局（U1–U5/F1）**：打开先看到该会话的规则列表（序号 · 类型 tag · 正文前 40 字 · 策略摘要 · 启用开关 · 编辑 · 删除；
+空态「还没有规则」），下面是类型胶囊；**内容文本域与注入策略默认折叠**，点任一类型展开（再点同一个类型收起）。
+底部只有一行说明，同时包含校验规则与「仅作用于本次对话；子会话同样适用。」（全局开关已整块删除）。
+状态行不再重复那句备注（由下方红字承担），显示为 `生效：全局已关闭`。
+
+**状态输出**：`vibe_bridge_status` 报 `会话规则：N 条`（无规则时 `会话规则：0 条（不会注入）`）+ 最多 5 条
+`type / strategy / 前 20 字 / enabled|disabled`；`/vibe-nudge status` 与 `status all` 同样带这段信息；面板对无规则会话显示
+`本会话未配置规则（不会注入）`。
 
 **向后兼容（只读）**：`nudges.json` 里带 `text` 的旧条目在运行时被当成一条**虚拟规则**，**不写任何文件**——
 `mode: every:N` → `every-n`+N，`full` → `every-message`，其余（无 mode / `sparse`）→ `every-n`+配置的 `everyTurns`；
@@ -376,7 +388,7 @@ a1f82c62-… [inactive] (top-level) — 重建工作区  ·  D:\ds_work  ·  --D
 ```
 
 - **注入策略**取代了旧的会话级节奏：`every-message`（每轮）、`every-n`（每 N 轮，`everyN ≥ 1`）、`first-message`（只一次，记标记，重启不重复）。同一轮命中多条规则会**合并成一段**，按类型打标签、按数组顺序输出。
-- **优先级**：`nudgeEnabled`（全局开关）→ `nudges.json` 的 `mode:"off"` → 本会话启用的规则 → `cordis.patch.yml` 里的全局规则。**没有规则的会话行为与改造前完全一致。**
+- **优先级**：`nudges.json` 的 `mode:"off"` → 本会话启用的规则 → `cordis.patch.yml` 里的全局规则。**没有规则的会话行为与改造前完全一致。**
 - **校验是整体拒绝**：`type` 五值、`content` 非空且 ≤4000、`strategies` 是三者非空子集、`everyN` 为 ≥1 整数、`id` 唯一；一条不合法就整体不写盘。
 - **失败不静默**：文件损坏或某会话字段非法时，该会话回落全局规则，`vibe_bridge_status` 用 `rulesError` 报原因（正常为 `""`，异常为 `parse failed: …` / `invalid rules: …`）。
 - **一次性自动迁移**：仍带旧 `text` 的会话会被建成一条规则，并**保持原节奏**（`mode: every:N` → `every-n N`；`mode: full` → `every-message`；其余 → `every-n` 并取配置的 `everyTurns`），随后删掉 `text`；写盘先写 rules 再写 nudges，失败两边都不动。再跑一次不产生变化，**已有规则的会话不会被覆盖**。

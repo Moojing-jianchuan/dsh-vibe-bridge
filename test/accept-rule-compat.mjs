@@ -1,16 +1,33 @@
 /**
- * 门槛 2 的三段对照（离线，临时 DSH_HOME）：
- *   A 转移/结构：命中轮次逐轮一致；source.kind / sections 名称 / 条数 byte-equal
- *   B 文案：去掉 `(类型) ` 前缀后 byte-equal；旧版发通用短句的轮次，新版也是通用短句
- *   C 只读：apply 不写 nudges.json / rules.json（字节不变）；off 逐字节一致；mode=off 压过规则零注入
+ * 门槛 2 的三段对照（离线，临时 DSH_HOME）。全局注入路径已砍掉，这里改成**同义对照**：
+ *
+ *   A 虚拟规则 vs 显式规则：同一段文案（旧 `nudges.json.text` 的只读虚拟规则）与
+ *     "同内容 + 等价策略"的显式规则 → 逐轮注入的条数 / `source.kind` / `source.sections`
+ *     byte-equal，正文一致（去掉 `(类型) ` 标签）。
+ *   B 隔离：会话 X 有规则时，会话 Y（无规则）**零注入**（不再有全局兜底）。
+ *   C 开关：`mode:"off"` + 有规则 → 零注入；`nudgeEnabled:false` + 有规则 → **仍然注入**。
+ *     另含：`apply` 前后两个状态文件字节不变、真实 home 目录快照。
  *
  * 运行：node test/accept-rule-compat.mjs
  */
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, utimesSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
+
+const REAL_HOME = process.env.DSH_HOME ?? path.join(homedir(), ".dsh");
+const snapshot = (file) => {
+  try {
+    return readFileSync(file).toString("base64");
+  } catch {
+    return undefined;
+  }
+};
+const realBefore = {
+  rules: snapshot(path.join(REAL_HOME, "vibe-bridge", "rules.json")),
+  nudges: snapshot(path.join(REAL_HOME, "vibe-bridge", "nudges.json")),
+};
 
 const HOME = mkdtempSync(path.join(tmpdir(), "vb-compat-"));
 process.env.DSH_HOME = HOME;
@@ -32,8 +49,7 @@ const check = async (title, fn) => {
 
 const mod = await import(pathToFileURL(path.resolve("lib/index.js")).href);
 
-/** 造一个最小宿主 ctx（只要 pre-step 与命令）。 */
-const boot = (configOverrides = {}) => {
+const boot = (overrides = {}) => {
   const hooks = [];
   const commands = [];
   const ctx = {
@@ -45,128 +61,117 @@ const boot = (configOverrides = {}) => {
     agents: { get: () => undefined },
     commands: { register: (definition) => (commands.push(definition), () => {}) },
   };
-  mod.apply(
-    ctx,
-    mod.Config({ enabled: true, provider: "spawn", persistWakeState: false, rules: [], everyTurns: 2, fullEveryTurns: 4, ...configOverrides }),
-  );
-  const preStep = hooks.find((h) => h.name === "agent/pre-step");
+  mod.apply(ctx, mod.Config({ enabled: true, provider: "spawn", persistWakeState: false, rules: [], everyTurns: 2, fullEveryTurns: 4, ...overrides }));
+  const preStep = hooks.find((hook) => hook.name === "agent/pre-step");
   return { preStep: preStep.handler, commands };
 };
 
-/** 跑若干轮，收集每轮注入的 message 数组（结构化，便于 byte-equal）。 */
 const collect = async (host, sessionId, turns) => {
   const out = [];
   for (const turn of turns) {
-    const decision = await host.preStep({ turn, agent: { id: sessionId, session: { id: sessionId } } }, async () => ({}));
+    const decision = await host.preStep({ turn, step: 1, agent: { id: sessionId, session: { id: sessionId } } }, async () => ({ kind: "continue", messages: [] }));
     out.push((decision?.messages ?? []).filter((message) => message.source?.kind === mod.name));
   }
   return out;
 };
 
 const textOf = (message) => message.content.map((part) => part.text).join("");
-/** 去掉注入行首的 `(类型) ` 前缀。 */
-const stripPrefix = (text) => text.replace(/\((规则|约束|偏好|约定|反馈)\) /g, "");
-const GENERIC = "自检一遍";
+/** 去掉注入行首的 `(类型) ` 标签（虚拟/显式规则的标签差异）。 */
+const stripLabel = (text) => text.replace(/\((规则|约束|偏好|约定|反馈)\) /g, "");
 
-/** 真实 home 的 vibe-bridge 目录快照（文件名 + 大小）：用于"跑完测试后真实 home 不得新增文件"。 */
-const realHomeSnapshot = () => {
-  const dir = path.join(process.env.USERPROFILE ?? process.env.HOME ?? '', '.dsh', 'vibe-bridge')
-  try {
-    const { readdirSync, statSync } = require('node:fs')
-    return readdirSync(dir)
-      .sort()
-      .map((name) => `${name}:${statSync(path.join(dir, name)).size}`)
-      .join('|')
-  } catch {
-    return '(missing)'
-  }
-}
-const realHomeBefore = realHomeSnapshot()
-
-await check("C0 真实 home 未被写（临时 DSH_HOME 生效）", () => {
-  assert.ok(HOME.includes("vb-compat-"), "DSH_HOME 应指向临时目录");
-  assert.equal(realHomeSnapshot(), realHomeBefore, "真实 home 的 vibe-bridge 目录在本套件运行期间不得变化");
-});
-
-// 前置：旧数据只在 nudges.json 里（无 rules.json）
+// ---- A：虚拟规则 vs 等价显式规则 ----
 writeFileSync(NUDGES, JSON.stringify({ "s-legacy": { text: "同一段提醒文案", updatedAt: new Date().toISOString() } }), "utf8");
-const nudgesBytes = readFileSync(NUDGES, "utf8");
-const rulesMissing = !readFileSync;
-const legacyHost = boot({ nudgeText: "同一段提醒文案" });
-const legacy = await collect(legacyHost, "s-legacy", [1, 2, 3, 4, 5]);
+utimesSync(NUDGES, new Date(), new Date(Date.now() + 1000)); // 这一行是防缓存假象：把 mtime 推到不同值，别删
+writeFileSync(RULES, "{}", "utf8");
+utimesSync(RULES, new Date(), new Date(Date.now() + 2000));
+const virtualHost = boot();
+const virtualRuns = await collect(virtualHost, "s-legacy", [1, 2, 3, 4, 5]);
 
-// 新版：同一份 nudges.json（现在走虚拟规则）
-const virtualHost = boot({ nudgeText: "同一段提醒文案" });
-const virtual = await collect(virtualHost, "s-legacy", [1, 2, 3, 4, 5]);
+writeFileSync(NUDGES, "{}", "utf8");
+utimesSync(NUDGES, new Date(), new Date(Date.now() + 3000));
+writeFileSync(
+  RULES,
+  JSON.stringify({
+    "s-legacy": [{ id: "explicit", type: "rule", content: "同一段提醒文案", strategies: ["every-n"], everyN: 2, enabled: true }],
+  }),
+  "utf8",
+);
+utimesSync(RULES, new Date(), new Date(Date.now() + 4000));
+const explicitHost = boot();
+const explicitRuns = await collect(explicitHost, "s-legacy", [1, 2, 3, 4, 5]);
 
-await check("A1 命中轮次逐轮一致（旧路径 vs 虚拟规则）", () => {
+await check("A1 命中轮次逐轮一致（虚拟规则 vs 等价显式规则）", () => {
   const hits = (runs) => runs.map((messages) => messages.length > 0);
-  assert.deepEqual(hits(virtual), hits(legacy), `旧 ${JSON.stringify(hits(legacy))} / 新 ${JSON.stringify(hits(virtual))}`);
+  assert.deepEqual(hits(virtualRuns), hits(explicitRuns), JSON.stringify({ virtual: hits(virtualRuns), explicit: hits(explicitRuns) }));
 });
 
-await check("A2 条数与 source.kind / sections 名称 byte-equal", () => {
-  for (let index = 0; index < legacy.length; index += 1) {
-    assert.equal(virtual[index].length, legacy[index].length, `第 ${index + 1} 轮条数`);
-    for (let k = 0; k < legacy[index].length; k += 1) {
-      const oldMessage = legacy[index][k];
-      const newMessage = virtual[index][k];
-      assert.equal(newMessage.source.kind, oldMessage.source.kind);
-      assert.equal(
-        JSON.stringify(newMessage.source.sections ?? null),
-        JSON.stringify(oldMessage.source.sections ?? null),
-        `第 ${index + 1} 轮 sections 结构`,
-      );
+await check("A2 条数 / source.kind / source.sections byte-equal", () => {
+  for (let index = 0; index < virtualRuns.length; index += 1) {
+    assert.equal(explicitRuns[index].length, virtualRuns[index].length, `第 ${index + 1} 轮条数`);
+    for (let k = 0; k < virtualRuns[index].length; k += 1) {
+      assert.equal(explicitRuns[index][k].source.kind, virtualRuns[index][k].source.kind);
+      assert.equal(JSON.stringify(explicitRuns[index][k].source.sections ?? null), JSON.stringify(virtualRuns[index][k].source.sections ?? null));
     }
   }
 });
 
-await check("B1 文案：去掉 `(类型) ` 前缀后 byte-equal；短句轮次也是短句", () => {
-  for (let index = 0; index < legacy.length; index += 1) {
-    const oldText = legacy[index].map(textOf).join("\n");
-    const newText = virtual[index].map(textOf).map(stripPrefix).join("\n");
-    assert.equal(newText, oldText, `第 ${index + 1} 轮文案`);
-    if (oldText.includes(GENERIC)) assert.ok(newText.includes(GENERIC), `第 ${index + 1} 轮旧版是短句，新版也必须是短句`);
+await check("A3 文案：去掉 `(类型) ` 标签后一致；短句轮次两边都是短句", () => {
+  for (let index = 0; index < virtualRuns.length; index += 1) {
+    const left = virtualRuns[index].map(textOf).map(stripLabel).join("\n");
+    const right = explicitRuns[index].map(textOf).map(stripLabel).join("\n");
+    assert.equal(right, left, `第 ${index + 1} 轮`);
+    if (left.includes("自检一遍")) assert.ok(right.includes("自检一遍"));
   }
 });
 
-await check("C1 apply 之后 nudges.json 字节不变、rules.json 仍不存在", () => {
-  assert.equal(readFileSync(NUDGES, "utf8"), nudgesBytes, "nudges.json 不该被 apply 改写");
-  let exists = true;
-  try {
-    readFileSync(RULES);
-  } catch {
-    exists = false;
-  }
-  assert.equal(exists, false, "没有写盘就不该创建 rules.json");
+// ---- B：无规则会话零注入 ----
+writeFileSync(NUDGES, "{}", "utf8");
+utimesSync(NUDGES, new Date(), new Date(Date.now() + 5000));
+writeFileSync(RULES, JSON.stringify({ "s-with": [{ id: "r1", type: "rule", content: "只有 X 有规则", strategies: ["every-message"], everyN: 3, enabled: true }] }), "utf8");
+utimesSync(RULES, new Date(), new Date(Date.now() + 6000));
+const isolateHost = boot();
+const withRules = await collect(isolateHost, "s-with", [1, 2, 3]);
+const withoutRules = await collect(isolateHost, "s-none", [1, 2, 3]);
+
+await check("B1 有规则的会话逐轮注入", () => {
+  assert.deepEqual(withRules.map((messages) => messages.length), [1, 1, 1]);
 });
 
-await check("C2 mode=off 逐字节一致 + 压过规则（零注入）", async () => {
-  // 旧：off（无规则）
-  writeFileSync(NUDGES, JSON.stringify({ "s-off": { mode: "off", updatedAt: new Date().toISOString() } }), "utf8");
-  utimesSync(NUDGES, new Date(), new Date(Date.now() + 1000)); // 换 mtime，绕开同毫秒缓存
-  const nudgesOffBytes = readFileSync(NUDGES, "utf8");
-  const offHost = boot({ nudgeText: "同一段提醒文案" });
-  const offRuns = await collect(offHost, "s-off", [1, 2, 3]);
-  assert.deepEqual(
-    offRuns.map((messages) => messages.length),
-    [0, 0, 0],
-    "off 时逐轮零注入",
-  );
-  // 新：off + 真实规则（规则必须被压住）
-  writeFileSync(
-    RULES,
-    JSON.stringify({ "s-off": [{ id: "r1", type: "rule", content: "不该出现", strategies: ["every-message"], everyN: 3, enabled: true }] }),
-    "utf8",
-  );
-  utimesSync(RULES, new Date(), new Date(Date.now() + 2000));
-  const offWithRules = boot({ nudgeText: "同一段提醒文案" });
-  const offWithRulesRuns = await collect(offWithRules, "s-off", [1, 2, 3]);
-  assert.deepEqual(
-    offWithRulesRuns.map((messages) => messages.length),
-    [0, 0, 0],
-    "mode=off 必须压过 rules.json",
-  );
-  assert.equal(readFileSync(NUDGES, "utf8"), nudgesOffBytes, "两个文件都不该被写");
+await check("B2 无规则会话逐轮零注入（不再有全局兜底）", () => {
+  assert.deepEqual(withoutRules.map((messages) => messages.length), [0, 0, 0]);
+});
+
+// ---- C：开关语义 ----
+writeFileSync(NUDGES, JSON.stringify({ "s-off": { mode: "off", updatedAt: new Date().toISOString() } }), "utf8");
+utimesSync(NUDGES, new Date(), new Date(Date.now() + 7000));
+writeFileSync(RULES, JSON.stringify({ "s-off": [{ id: "r-off", type: "rule", content: "不该出现", strategies: ["every-message"], everyN: 3, enabled: true }] }), "utf8");
+utimesSync(RULES, new Date(), new Date(Date.now() + 8000));
+const offHost = boot();
+const offRuns = await collect(offHost, "s-off", [1, 2, 3]);
+
+await check("C1 mode=off 压过规则：逐轮零注入", () => {
+  assert.deepEqual(offRuns.map((messages) => messages.length), [0, 0, 0]);
+});
+
+writeFileSync(NUDGES, "{}", "utf8");
+utimesSync(NUDGES, new Date(), new Date(Date.now() + 9000));
+// 换一个会话 id：同一会话同一轮只会注入一次（spoken 去重），这里要的是"新会话也照样注入"。
+writeFileSync(RULES, JSON.stringify({ "s-disabled": [{ id: "r-d", type: "rule", content: "全局关掉也要注入", strategies: ["every-message"], everyN: 3, enabled: true }] }), "utf8");
+utimesSync(RULES, new Date(), new Date(Date.now() + 9500));
+const snapshotBefore = { rules: snapshot(RULES), nudges: snapshot(NUDGES) };
+const disabledHost = boot({ nudgeEnabled: false });
+const disabledRuns = await collect(disabledHost, "s-disabled", [1, 2, 3]);
+
+await check("C2 nudgeEnabled:false 仍然注入会话规则（与上一版相反）", () => {
+  assert.deepEqual(disabledRuns.map((messages) => messages.length), [1, 1, 1]);
+  assert.equal(snapshot(RULES), snapshotBefore.rules, "apply 不该写 rules.json");
+  assert.equal(snapshot(NUDGES), snapshotBefore.nudges, "apply 不该写 nudges.json");
+});
+
+await check("C3 真实 home 未被写（临时 DSH_HOME 生效）", () => {
+  assert.ok(HOME.includes("vb-compat-"));
+  assert.equal(snapshot(path.join(REAL_HOME, "vibe-bridge", "rules.json")), realBefore.rules);
+  assert.equal(snapshot(path.join(REAL_HOME, "vibe-bridge", "nudges.json")), realBefore.nudges);
 });
 
 console.log(results.join("\n"));

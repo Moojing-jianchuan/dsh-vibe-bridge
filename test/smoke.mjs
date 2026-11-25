@@ -144,6 +144,9 @@ const baseRules = [
 // 测试里关掉落盘：不要往真实的 ~/.dsh 里写状态（落盘由 test/wake-state-probe.mjs 用临时目录验证）。
 const config = Config({ enabled: true, rules: baseRules, provider: "spawn", persistWakeState: false });
 
+/** 会话规则用例的配置基线：全局 rules 已不参与注入。 */
+const baseConfigForRules = () => ({ enabled: true, provider: "spawn", persistWakeState: false, rules: [] });
+
 check("Config 归一化：默认值补齐", () => {
   assert.equal(config.provider, "spawn");
   assert.equal(config.enableSpawn, true);
@@ -173,97 +176,73 @@ check("注册了 1 个中间件 + 8 个工具", () => {
 });
 
 const run = async () => {
-  // ---- 碎碎念节奏 ----
-  const turn1 = await step(preStep[0], { turn: 1 });
-  const injected1 = turn1.messages.filter((m) => m.source?.kind === name);
-  assert.equal(injected1.length, 1, "turn 1 应注入一条");
-  const text1 = injected1[0].content.map((p) => p.text).join("");
-  assert.match(text1, /\[SYSTEM REMINDER:task\]/, "应带标记");
-  assert.match(text1, /这行只应出现在全量提醒里/, "turn 1 应为全量文案");
-  assert.equal(injected1[0].source.form, "snapshot");
-  results.push("PASS  turn 1 注入全量碎碎念");
+  // ---- 会话级碎碎念（全局路径已砍掉：没有会话规则 = 零注入）----
+  const rulesFile = path.join(TEST_HOME, "vibe-bridge", "rules.json");
+  const nudgesFile = path.join(TEST_HOME, "vibe-bridge", "nudges.json");
+  const seedRulesFile = (value) => {
+    mkdirSync(path.join(TEST_HOME, "vibe-bridge"), { recursive: true });
+    writeFileSync(rulesFile, JSON.stringify(value), "utf8");
+  };
+  const seedNudgesFile = (value) => {
+    mkdirSync(path.join(TEST_HOME, "vibe-bridge"), { recursive: true });
+    writeFileSync(nudgesFile, JSON.stringify(value), "utf8");
+  };
+  /** 某会话某轮的注入正文。 */
+  const injectedTextAt = async (target, sessionId, turn) => {
+    const decision = await step(target.preStep[0], { turn, agent: { id: sessionId, session: { id: sessionId } } });
+    return decision.messages
+      .filter((message) => message.source?.kind === name)
+      .map((message) => message.content.map((part) => part.text).join(""))
+      .join("");
+  };
 
-  const turn2 = await step(preStep[0], { turn: 2 });
-  const text2 = turn2.messages.filter((m) => m.source?.kind === name).map((m) => m.content.map((p) => p.text).join("")).join("");
-  assert.match(text2, /稀疏/, "turn 2 应为稀疏文案");
-  assert.doesNotMatch(text2, /第四行/);
-  results.push("PASS  turn 2 注入稀疏碎碎念");
+  seedRulesFile({});
+  seedNudgesFile({});
+  for (const turn of [1, 2, 3, 4, 5]) {
+    assert.equal(await injectedTextAt({ preStep }, "session-bare", turn), "", `无规则会话第 ${turn} 轮不该注入`);
+  }
+  results.push("PASS  无会话规则 → 5 轮零注入（没有全局兜底）");
 
-  const turn3 = await step(preStep[0], { turn: 3 });
-  const text3 = turn3.messages.filter((m) => m.source?.kind === name).map((m) => m.content.map((p) => p.text).join("")).join("");
-  // 稀疏文案与上一轮完全相同 → 只发一行短标记，不再重复整段
-  assert.match(text3, /内容同上一轮/, "turn 3 应命中“同文不重发”");
-  assert.doesNotMatch(text3, /稀疏/, "重复的稀疏正文不应再出现");
-  results.push("PASS  turn 3 稀疏同文 → 只发短标记（省 token，节奏不变）");
+  // 有会话规则：按规则注入（every-message）
+  seedRulesFile({ "session-rules": [{ id: "r1", type: "rule", content: "只按会话规则注入", strategies: ["every-message"], everyN: 3, enabled: true }] });
+  const rulesCtx = makeCtx(config);
+  assert.match(await injectedTextAt(rulesCtx, "session-rules", 1), /只按会话规则注入/);
+  results.push("PASS  有会话规则 → 按规则注入");
 
-  // 换了文案就应重新发全文：改 nudge 文件后清掉记忆，验证仍给完整稀疏文案
-  const freshRules = Config({
-    enabled: true,
-    rules: [{ name: "task", text: "甲行\n乙行\n丙行\n丁行", sparseText: "另一段稀疏文案", everyTurns: 1, fullEveryTurns: 0 }],
+  // nudgeEnabled:false 不再影响注入（配置键保留但 deprecated）
+  seedRulesFile({ "session-rules-off": [{ id: "r2", type: "rule", content: "关了全局也要注入", strategies: ["every-message"], everyN: 3, enabled: true }] });
+  const disabledCtx = makeCtx(Config({ ...baseConfigForRules(), nudgeEnabled: false }));
+  assert.match(await injectedTextAt(disabledCtx, "session-rules-off", 1), /关了全局也要注入/, "nudgeEnabled 不该再压掉会话规则");
+  results.push("PASS  nudgeEnabled:false 不影响会话规则注入（deprecated 键）");
+
+  // skipSubagentSessions：子会话整体不注入会话规则
+  const subCtx = makeCtx(Config({ ...baseConfigForRules(), skipSubagentSessions: true }));
+  const subDecision = await step(subCtx.preStep[0], {
+    turn: 1,
+    agent: { id: "child-x", session: { id: "child-x", origin: "subagent", parentSession: "session-rules" } },
   });
-  const fresh = makeCtx(freshRules);
-  await step(fresh.preStep[0], { turn: 1 });
-  const freshTurn2 = await step(fresh.preStep[0], { turn: 2 });
-  const freshText = freshTurn2.messages.filter((m) => m.source?.kind === name).map((m) => m.content.map((p) => p.text).join("")).join("");
-  assert.match(freshText, /另一段稀疏文案/, "内容变化时不应被压缩成标记");
-  results.push("PASS  稀疏文案变化时照常发全文");
+  assert.equal(subDecision.messages.filter((message) => message.source?.kind === name).length, 0, "子会话不该注入会话规则");
+  results.push("PASS  skipSubagentSessions 让子会话整体不注入会话规则");
 
-  const turn6 = await step(preStep[0], { turn: 6 });
-  const text6 = turn6.messages.filter((m) => m.source?.kind === name).map((m) => m.content.map((p) => p.text).join("")).join("");
-  assert.match(text6, /第四行/, "turn 6 偏移 5 % 5 === 0，应为全量文案");
-  results.push("PASS  turn 6 命中全量节奏（首轮 + 每 5 轮）");
+  // status 文本带上会话规则条数
+  const statusOut = await commands.find((command) => command.name === "vibe-nudge").handler({ agent: { id: "session-bare" }, rawInput: "status" });
+  assert.match(statusOut.text, /会话规则：0 条（不会注入）/);
+  results.push("PASS  /vibe-nudge status 报「会话规则：0 条（不会注入）」");
 
-  const throttle = Config({ enabled: true, rules: [{ name: "t2", text: "隔两轮", everyTurns: 2, fullEveryTurns: 0 }] });
-  const th = makeCtx(throttle);
-  const hits = [];
-  for (const turn of [1, 2, 3, 5]) {
-    const decision = await step(th.preStep[0], { turn });
-    hits.push([turn, decision.messages.filter((m) => m.source?.kind === name).length]);
-  }
-  assert.deepEqual(hits, [[1, 1], [2, 0], [3, 1], [5, 1]], "everyTurns=2 应为 1、3、5 轮命中");
-  results.push("PASS  everyTurns 节流");
+  // 同一轮第二次 step 不重复注入（会话规则路径同样成立；独立会话避开去重记忆）
+  seedRulesFile({ "session-retry": [{ id: "r-retry", type: "rule", content: "重试也要注入", strategies: ["every-message"], everyN: 3, enabled: true }] });
+  const retryCtx = makeCtx(config);
+  const first = await injectedTextAt(retryCtx, "session-retry", 1);
+  const again = await injectedTextAt(retryCtx, "session-retry", 1);
+  assert.ok(first.length > 0, "第 1 轮应注入");
+  assert.equal(again, "", "同一轮重试不该再注入");
+  results.push("PASS  同轮重试不重复注入（会话规则路径）");
 
-  const stepTwo = await step(preStep[0], { turn: 7, step: 2 });
-  assert.equal(stepTwo.messages.filter((m) => m.source?.kind === name).length, 0, "非第一步不注入");
-  results.push("PASS  同一轮的第二 step 不重复注入");
-
-  const replay = await step(preStep[0], { turn: 1 });
-  assert.equal(replay.messages.filter((m) => m.source?.kind === name).length, 0, "同一 (session, turn) 不重复注入");
-  results.push("PASS  同轮重试不重复注入");
-
-  const childAgent = { id: "session-child", session: { id: "session-child", header: { origin: "subagent" } } };
-  const inChild = await step(preStep[0], { turn: 1, agent: childAgent });
-  assert.equal(inChild.messages.filter((m) => m.source?.kind === name).length, 0, "子会话默认不念");
-  const forceChild = Config({ enabled: true, rules: [{ name: "all", text: "子会话也念", skipSubagentSessions: false }] });
-  const forced = makeCtx(forceChild);
-  const forcedDecision = await step(forced.preStep[0], { turn: 1, agent: childAgent });
-  assert.equal(forcedDecision.messages.filter((m) => m.source?.kind === name).length, 1, "关掉 skip 后子会话也念");
-  results.push("PASS  skipSubagentSessions 只对子会话生效");
-
-  const ruleOff = Config({ enabled: true, rules: [{ name: "later", text: "第 10 轮才念", fromTurn: 10, toTurn: 12 }] });  const off = makeCtx(ruleOff);
-  for (const turn of [1, 9, 11, 13]) {
-    const decision = await step(off.preStep[0], { turn });
-    const count = decision.messages.filter((m) => m.source?.kind === name).length;
-    const expected = turn === 11 ? 1 : 0;
-    assert.equal(count, expected, `fromTurn/toTurn 区间内才注入（turn=${turn}）`);
-  }
-  results.push("PASS  fromTurn/toTurn 生效区间");
-
-  // speakOnFirstSeen：插件中途装上（会话已经到第 7 轮）也要立刻看见效果
-  const late = Config({ enabled: true, rules: [{ name: "late", text: "全量文案\n第二行\n第三行", everyTurns: 4, fullEveryTurns: 12 }] });
-  const lateCtx = makeCtx(late);
-  const firstAt7 = await step(lateCtx.preStep[0], { turn: 7 });
-  const t7 = firstAt7.messages.filter((m) => m.source?.kind === name).map((m) => m.content.map((p) => p.text).join("")).join("");
-  assert.match(t7, /第三行/, "第 7 轮首次遇到应念全量");
-  const at8 = await step(lateCtx.preStep[0], { turn: 8 });
-  assert.equal(at8.messages.filter((m) => m.source?.kind === name).length, 0, "第 8 轮不满足节奏");
-  const at9 = await step(lateCtx.preStep[0], { turn: 9 });
-  assert.equal(at9.messages.filter((m) => m.source?.kind === name).length, 1, "第 9 轮满足 everyTurns=4");
-  const noFirst = Config({ enabled: true, rules: [{ name: "late2", text: "X", everyTurns: 4, fullEveryTurns: 12, speakOnFirstSeen: false }] });
-  const nf = makeCtx(noFirst);
-  const nfAt7 = await step(nf.preStep[0], { turn: 7 });
-  assert.equal(nfAt7.messages.filter((m) => m.source?.kind === name).length, 0, "关掉 speakOnFirstSeen 后不抢跑");
-  results.push("PASS  speakOnFirstSeen 让中途装载也能立刻开口");
+  // mode=off 压过规则
+  seedNudgesFile({ "session-rules": { mode: "off", updatedAt: new Date().toISOString() } });
+  const offCtx = makeCtx(config);
+  assert.equal(await injectedTextAt(offCtx, "session-rules", 1), "", "mode=off 应整会话零注入");
+  results.push("PASS  mode=off 压过 rules.json（零注入）");
 
   // ---- 工具契约 ----
   const spawned = await tools.get("spawn_session").execute(
@@ -367,11 +346,12 @@ const run = async () => {
   assert.equal(emptyTask.kind, "error");
   results.push("PASS  /vibe-spawn 命令直接创建子会话（含空任务校验）");
 
-  // 成本可见：status 报注入字符数
+  // 成本可见：status 报注入字符数（全局注入已砍掉，这里只断言形状与会话规则条数）
   const statusValue = await tools.get("vibe_bridge_status").execute({}, {});
   assert.equal(typeof statusValue.injectedChars, "number");
-  assert.ok(statusValue.injectedChars > 0, "本次会话已有注入，字符数应大于 0");
-  results.push("PASS  vibe_bridge_status 报成本（注入字符数）");
+  assert.equal(typeof statusValue.injected, "number");
+  assert.equal(typeof statusValue.sessionRulesCount, "number", "应报当前会话的规则条数");
+  results.push("PASS  vibe_bridge_status 报成本（注入字符数）与会话规则条数");
 
   console.log(results.join("\n"));
 };
@@ -1152,28 +1132,41 @@ const scheduleCheck = async () => {
   const scalarCtx = makeCtx(
     Config({ ...base, rules: [], everyTurns: 2, fullEveryTurns: 4, fromTurn: 1, speakOnFirstSeen: false }),
   );
-  await checkAsync("A1 只给顶层标量（rules:[]）→ everyTurns=2 决定节奏（1/3/5 命中，2/4 不命中）", async () => {
-    const { pattern, texts } = await patternOf(scalarCtx, [1, 2, 3, 4, 5]);
-    assert.deepEqual(pattern, [true, false, true, false, true]);
-    assert.match(texts.get(1), /\[SYSTEM REMINDER:nudge\]/, "隐式规则的标记名应为 nudge");
+  await checkAsync("A1 只有顶层标量、没有会话规则 → 零注入（全局节奏已不参与）", async () => {
+    writeFileSync(path.join(TEST_HOME, "vibe-bridge", "rules.json"), "{}", "utf8");
+    writeFileSync(path.join(TEST_HOME, "vibe-bridge", "nudges.json"), "{}", "utf8");
+    const ctx = makeCtx(Config({ ...baseConfigForRules(), everyTurns: 2, fullEveryTurns: 4 }));
+    for (const turn of [1, 2, 3]) {
+      const decision = await step(ctx.preStep[0], { turn, agent: { id: "session-a1", session: { id: "session-a1" } } });
+      assert.equal(decision.messages.filter((message) => message.source?.kind === name).length, 0);
+    }
   });
 
   const overrideCtx = makeCtx(
     Config({ ...base, rules: [{ name: "r", text: "MARK-RULE", everyTurns: 1 }], everyTurns: 2, speakOnFirstSeen: false }),
   );
-  await checkAsync("A2 规则内 everyTurns=1 覆盖顶层 everyTurns=2 → 每轮都注入", async () => {
-    const { pattern } = await patternOf(overrideCtx, [1, 2, 3]);
-    assert.deepEqual(pattern, [true, true, true]);
+  await checkAsync("A2 every-message 规则：每轮都注入", async () => {
+    writeFileSync(path.join(TEST_HOME, "vibe-bridge", "rules.json"), JSON.stringify({ "session-a2": [{ id: "a2", type: "rule", content: "每轮都要看", strategies: ["every-message"], everyN: 3, enabled: true }] }), "utf8");
+    const ctx = makeCtx(Config({ ...baseConfigForRules() }));
+    for (const turn of [1, 2, 3]) {
+      const decision = await step(ctx.preStep[0], { turn, agent: { id: "session-a2", session: { id: "session-a2" } } });
+      assert.equal(decision.messages.filter((message) => message.source?.kind === name).length, 1, "每轮都应注入");
+    }
   });
 
   const legacyCtx = makeCtx(
     Config({ ...base, rules: [{ name: "legacy", text: "LEGACY-TEXT", everyTurns: 4, fullEveryTurns: 12 }] }),
   );
-  await checkAsync("A3 老配置（规则内 everyTurns=4/fullEveryTurns=12，无顶层键）行为不变", async () => {
-    const { pattern, texts } = await patternOf(legacyCtx, [1, 2, 3, 4, 5]);
-    assert.deepEqual(pattern, [true, false, false, false, true]);
-    assert.match(texts.get(1), /LEGACY-TEXT/);
-    assert.match(texts.get(1), /\[SYSTEM REMINDER:legacy\]/);
+  await checkAsync("A3 every-n(4)：只第 1、5 轮注入", async () => {
+    writeFileSync(path.join(TEST_HOME, "vibe-bridge", "rules.json"), JSON.stringify({ "session-a3": [{ id: "a3", type: "rule", content: "每四轮", strategies: ["every-n"], everyN: 4, enabled: true }] }), "utf8");
+    const ctx = makeCtx(Config({ ...baseConfigForRules() }));
+    const countAt = async (turn) => {
+      const decision = await step(ctx.preStep[0], { turn, agent: { id: "session-a3", session: { id: "session-a3" } } });
+      return decision.messages.filter((message) => message.source?.kind === name).length;
+    };
+    assert.equal(await countAt(1), 1);
+    assert.equal(await countAt(2), 0);
+    assert.equal(await countAt(5), 1);
   });
 
   console.log(results.slice(firstNew).join("\n"));
@@ -1206,40 +1199,44 @@ const sessionNudgeCheck = async () => {
 
   const off = await control().execute({ session_id: "session-off", mode: "off" }, {});
 
-  await checkAsync("B1 off：该会话零注入，其它会话不受影响", async () => {
-    assert.equal(off.mode, "off");
-    assert.equal(off.source, "session");
-    assert.equal(await injectedAt(ctx, "session-off", 1), false);
-    assert.equal(await injectedAt(ctx, "session-off", 3), false);
-    assert.equal(await injectedAt(ctx, "session-other", 1), true, "其它会话仍按全局节奏");
+  await checkAsync("B1 off：该会话零注入（没有规则的会话同样零注入）", async () => {
+    writeFileSync(path.join(TEST_HOME, "vibe-bridge", "rules.json"), "{}", "utf8");
+    writeFileSync(path.join(TEST_HOME, "vibe-bridge", "nudges.json"), JSON.stringify({ "session-off2": { mode: "off", updatedAt: new Date().toISOString() } }), "utf8");
+    const ctx = makeCtx(Config({ ...baseConfigForRules() }));
+    const countAt = async (sessionId, turn) => {
+      const decision = await step(ctx.preStep[0], { turn, agent: { id: sessionId, session: { id: sessionId } } });
+      return decision.messages.filter((message) => message.source?.kind === name).length;
+    };
+    assert.equal(await countAt("session-off2", 1), 0);
+    assert.equal(await countAt("session-off2", 3), 0);
+    assert.equal(await countAt("session-other2", 1), 0, "没有规则也零注入");
   });
 
 
-  await checkAsync("B3 clear：删除覆盖、回落全局（第 5 轮命中），返回 source:'global'", async () => {
-    const cleared = await control().execute({ session_id: "session-every", mode: "clear" }, {});
+  await checkAsync("B3 clear：删掉 mode（无文案则整条消失），返回 source:'global'", async () => {
+    const nudges = path.join(TEST_HOME, "vibe-bridge", "nudges.json");
+    writeFileSync(nudges, JSON.stringify({ "session-b3": { mode: "off", updatedAt: new Date().toISOString() } }), "utf8");
+    const ctx = makeCtx(Config({ ...baseConfigForRules() }));
+    const cleared = await ctx.tools.get("nudge_control").execute({ session_id: "session-b3", mode: "clear" }, {});
     assert.equal(cleared.source, "global");
-    assert.equal(cleared.mode, "global");
-    // 第 4 轮全局不命中、第 5 轮命中 —— 证明真的回到了全局节奏
-    assert.equal(await injectedAt(ctx, "session-every", 4), false);
-    assert.equal(await injectedAt(ctx, "session-every", 5), true);
+    assert.equal(JSON.parse(readFileSync(nudges, "utf8"))["session-b3"], undefined);
   });
 
-  await checkAsync("B4 重新 apply（模拟重启）后覆盖仍生效（读盘）", async () => {
-    await control().execute({ session_id: "session-persist", mode: "off" }, {});
-    const restarted = makeCtx(Config(baseConfig));
-    assert.equal(await injectedAt(restarted, "session-persist", 1), false, "重启后覆盖应仍生效");
-    assert.equal(await injectedAt(restarted, "session-persist-other", 1), true);
-    // 状态文件形状符合约定：{ "<sessionId>": { mode, updatedAt } }
-    const parsed = JSON.parse(readFileSync(nudgesPath, "utf8"));
-    assert.equal(parsed["session-persist"].mode, "off");
-    assert.match(parsed["session-persist"].updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+  await checkAsync("B4 重新 apply（模拟重启）后 off 仍压过规则", async () => {
+    const nudges = path.join(TEST_HOME, "vibe-bridge", "nudges.json");
+    writeFileSync(nudges, JSON.stringify({ "session-b4": { mode: "off", updatedAt: new Date().toISOString() } }), "utf8");
+    writeFileSync(path.join(TEST_HOME, "vibe-bridge", "rules.json"), JSON.stringify({ "session-b4": [{ id: "b4", type: "rule", content: "不该出现", strategies: ["every-message"], everyN: 3, enabled: true }] }), "utf8");
+    const ctx = makeCtx(Config({ ...baseConfigForRules() }));
+    const decision = await step(ctx.preStep[0], { turn: 1, agent: { id: "session-b4", session: { id: "session-b4" } } });
+    assert.equal(decision.messages.filter((message) => message.source?.kind === name).length, 0, "重启后 off 仍然压过规则");
   });
 
 
-  await checkAsync("B6 坏 JSON：视作空表，pre-step 不抛错", async () => {
-    writeFileSync(nudgesPath, "{ this is not json", "utf8");
-    const broken = makeCtx(Config(baseConfig));
-    assert.equal(await injectedAt(broken, "session-off", 1), true, "坏表等于没有覆盖，应回到全局节奏");
+  await checkAsync("B6 坏 JSON：nudges.json 视作空表，pre-step 不抛错", async () => {
+    writeFileSync(path.join(TEST_HOME, "vibe-bridge", "nudges.json"), "{not json", "utf8");
+    const ctx = makeCtx(Config({ ...baseConfigForRules() }));
+    const decision = await step(ctx.preStep[0], { turn: 1, agent: { id: "session-b6", session: { id: "session-b6" } } });
+    assert.equal(decision.messages.filter((message) => message.source?.kind === name).length, 0);
   });
 
   await checkAsync("B7 /vibe-nudge：无参在 off↔全局之间切换；已移除的模式报错且不写盘", async () => {
@@ -1255,15 +1252,16 @@ const sessionNudgeCheck = async () => {
     assert.equal(JSON.parse(readFileSync(nudgesPath, "utf8"))["session-toggle"], undefined);
   });
 
-  await checkAsync("B8 /vibe-nudge status：cadence / rules / overrides / session / tip 五行", async () => {
+  await checkAsync("B8 /vibe-nudge status：cadence / rules / overrides / session / 会话规则 / tip", async () => {
     const command = ctx.commands.find((definition) => definition.name === "vibe-nudge");
-    const out = await command.handler({ agent: { id: "session-other" }, rawInput: "status" });
+    const out = await command.handler({ agent: { id: "session-b8" }, rawInput: "status" });
     const lines = out.text.split("\n");
     assert.match(lines[0], /^every \d+ · full every \d+ · from turn \d+/);
     assert.match(lines[1], /^rules: /);
     assert.match(lines[2], /^overrides: \d+/);
     assert.match(lines[3], /^session: mode=\S+ text=\S+$/);
-    assert.match(lines[4], /^tip: 无参第一次/);
+    assert.match(lines[4], /^会话规则：\d+ 条/);
+    assert.match(lines.at(-1), /^tip: 无参第一次/);
   });
 
   console.log(results.slice(firstNew).join("\n"));
@@ -1304,73 +1302,29 @@ const nudgeTextCheck = async () => {
 
 
 
-  await checkAsync("C5 status all：固定格式（global 行 + 只列有覆盖的会话）", async () => {
-    writeFileSync(nudgesPath, "{}", "utf8");
-    const fresh = makeCtx(Config(baseConfig));
-    const freshCommand = fresh.commands.find((definition) => definition.name === "vibe-nudge");
-    await freshCommand.handler({ agent: { id: "session-c5a" }, rawInput: "off" });
-    await freshCommand.handler({ agent: { id: "session-c5b" }, rawInput: "off" });
-    const all = await freshCommand.handler({ agent: { id: "session-c5a" }, rawInput: "status all" });
-    const lines = all.text.split("\n");
-    assert.equal(lines[0], "global: on · every 2 · full 4 · from 1");
-    assert.ok(lines.includes("session-c5a: off text=no"), all.text);
-    assert.ok(lines.includes("session-c5b: off text=no"), all.text);
-  });
 
-  await checkAsync("C6 status all：没有任何覆盖时只回 global 行", async () => {
-    writeFileSync(nudgesPath, "{}", "utf8");
-    const fresh = makeCtx(Config(baseConfig));
-    const freshCommand = fresh.commands.find((definition) => definition.name === "vibe-nudge");
-    const all = await freshCommand.handler({ agent: { id: "session-z" }, rawInput: "status all" });
-    assert.equal(all.text, "global: on · every 2 · full 4 · from 1");
-  });
 
   // ---- 全局开关（nudgeEnabled）----
-  await checkAsync("C7 nudgeEnabled:false → 任何会话零注入（含 full 覆盖），通知不受影响", async () => {
-    writeFileSync(nudgesPath, JSON.stringify({ "session-g1": { mode: "full", updatedAt: new Date().toISOString() } }), "utf8");
-    const off = makeCtx(Config({ ...baseConfig, nudgeEnabled: false }));
-    const offCommand = off.commands.find((definition) => definition.name === "vibe-nudge");
-    const textAt = async (sessionId, turn) => {
-      const decision = await step(off.preStep[0], { turn, agent: { id: sessionId, session: { id: sessionId } } });
-      return decision.messages
-        .filter((message) => message.source?.kind === name)
-        .map((message) => message.content.map((part) => part.text).join(""))
-        .join("");
+
+  await checkAsync("C8 mode=off 与规则互不干扰：off 零注入、有规则的照常", async () => {
+    writeFileSync(path.join(TEST_HOME, "vibe-bridge", "nudges.json"), JSON.stringify({ "session-h1": { mode: "off", updatedAt: new Date().toISOString() } }), "utf8");
+    writeFileSync(
+      path.join(TEST_HOME, "vibe-bridge", "rules.json"),
+      JSON.stringify({
+        "session-h1": [{ id: "h1", type: "rule", content: "被 off 压住", strategies: ["every-message"], everyN: 3, enabled: true }],
+        "session-h2": [{ id: "h2", type: "rule", content: "照常注入", strategies: ["every-message"], everyN: 3, enabled: true }],
+      }),
+      "utf8",
+    );
+    const on = makeCtx(Config({ ...baseConfigForRules(), nudgeEnabled: true }));
+    const at = async (sessionId) => {
+      const decision = await step(on.preStep[0], { turn: 1, agent: { id: sessionId, session: { id: sessionId } } });
+      return decision.messages.filter((message) => message.source?.kind === name).map((message) => message.content.map((part) => part.text).join("")).join("");
     };
-    assert.equal(await textAt("session-g1", 1), "", "full 覆盖也不该在全局关闭时注入");
-    assert.equal(await textAt("session-g2", 1), "", "普通会话也不注入");
-    // status 首行带 global off
-    const all = await offCommand.handler({ agent: { id: "session-g1" }, rawInput: "status all" });
-    assert.equal(all.text.split("\n")[0], "global: off · every 2 · full 4 · from 1");
-    const single = await offCommand.handler({ agent: { id: "session-g1" }, rawInput: "status" });
-    assert.match(single.text.split("\n")[0], /global off$/);
+    assert.equal(await at("session-h1"), "", "off 会话零注入");
+    assert.match(await at("session-h2"), /照常注入/);
   });
 
-  await checkAsync("C8 nudgeEnabled:true + 会话 off：该会话零注入，其它会话正常（两开关不互相干扰）", async () => {
-    writeFileSync(nudgesPath, JSON.stringify({ "session-h1": { mode: "off", updatedAt: new Date().toISOString() } }), "utf8");
-    const on = makeCtx(Config({ ...baseConfig, nudgeEnabled: true }));
-    const textAt = async (sessionId, turn) => {
-      const decision = await step(on.preStep[0], { turn, agent: { id: sessionId, session: { id: sessionId } } });
-      return decision.messages
-        .filter((message) => message.source?.kind === name)
-        .map((message) => message.content.map((part) => part.text).join(""))
-        .join("");
-    };
-    assert.equal(await textAt("session-h1", 1), "", "会话 off 应零注入");
-    assert.match(await textAt("session-h2", 1), /GLOBAL-TEXT/, "其它会话照常注入");
-  });
-
-  await checkAsync("C9 status / status all 首行的 global on|off 前缀（两种状态）", async () => {
-    writeFileSync(nudgesPath, "{}", "utf8");
-    const on = makeCtx(Config({ ...baseConfig, nudgeEnabled: true }));
-    const onCommand = on.commands.find((definition) => definition.name === "vibe-nudge");
-    assert.equal((await onCommand.handler({ agent: { id: "s" }, rawInput: "status all" })).text.split("\n")[0], "global: on · every 2 · full 4 · from 1");
-    assert.match((await onCommand.handler({ agent: { id: "s" }, rawInput: "status" })).text.split("\n")[0], /· global on$/);
-    const off = makeCtx(Config({ ...baseConfig, nudgeEnabled: false }));
-    const offCommand = off.commands.find((definition) => definition.name === "vibe-nudge");
-    assert.equal((await offCommand.handler({ agent: { id: "s" }, rawInput: "status all" })).text.split("\n")[0], "global: off · every 2 · full 4 · from 1");
-    assert.match((await offCommand.handler({ agent: { id: "s" }, rawInput: "status" })).text.split("\n")[0], /· global off$/);
-  });
 
   console.log(results.slice(firstNew).join("\n"));
 };
@@ -1481,10 +1435,10 @@ const rulesCheck = async () => {
     assert.equal(text.split("[SYSTEM REMINDER:nudge]").length - 1, 1, "同轮合并成一段");
   });
 
-  await checkAsync("R4 规则全部 enabled:false → 回落旧全局规则（不静默零注入）", async () => {
+  await checkAsync("R4 规则全部 enabled:false → 零注入（没有全局兜底）", async () => {
     seedRules({ "session-r4": [rule("z", "停用的规则", ["every-message"], { enabled: false })] });
     const ctx = makeCtx(Config(baseConfig));
-    assert.match(await textAt(ctx, "session-r4", 1), /GLOBAL-R/);
+    assert.equal(await textAt(ctx, "session-r4", 1), "", "全停用也不该回落到全局");
   });
 
   await checkAsync("R5 rules:<base64> 非法输入整体拒绝且文件字节不变", async () => {
@@ -1590,7 +1544,49 @@ const rulesCheck = async () => {
     assert.equal(cleared.kind, "success");
     // 清空后该会话没有规则 → 整张表为空 → 文件应被删除（不是写成 {}）。
     assert.equal(existsSync(rulesPath), false, "空 text: 清掉那一条后 rules.json 应不存在");
-    assert.match(await textAt(ctx, "session-alias", 1), /GLOBAL-R/, "清空后回落旧路径");
+    assert.equal(await textAt(ctx, "session-alias", 1), "", "清空后没有规则 → 零注入");
+  });
+
+  await checkAsync("F2 vibe_bridge_status 的 render 反映 rules.json（条数 + 明细）", async () => {
+    writeFileSync(nudgesPath, "{}", "utf8");
+    seedRules({
+      "session-f2": [
+        { id: "f2a", type: "constraint", content: "不要用 print 调试，改用日志", strategies: ["every-message"], everyN: 3, enabled: true },
+        { id: "f2b", type: "preference", content: "回答先说结论再给理由", strategies: ["every-n"], everyN: 4, enabled: false },
+      ],
+    });
+    const ctx = makeCtx(Config(baseConfig));
+    const tool = ctx.tools.get("vibe_bridge_status");
+    const value = await tool.execute({}, { agent: { id: "session-f2" } });
+    assert.equal(value.sessionRulesCount, 2);
+    const text = tool.output.render({}, value).map((part) => part.text).join("\n");
+    assert.match(text, /会话规则：2 条/);
+    assert.match(text, /constraint \/ every-message \/ /);
+    assert.match(text, /preference \/ every-n \/ /);
+    assert.match(text, /disabled/);
+  });
+
+  await checkAsync("F2 规则清空后 render 报「会话规则：0 条（不会注入）」", async () => {
+    writeFileSync(rulesPath, "{}", "utf8");
+    const ctx = makeCtx(Config(baseConfig));
+    const tool = ctx.tools.get("vibe_bridge_status");
+    const value = await tool.execute({}, { agent: { id: "session-f2" } });
+    assert.equal(value.sessionRulesCount, 0);
+    const text = tool.output.render({}, value).map((part) => part.text).join("\n");
+    assert.match(text, /会话规则：0 条（不会注入）/);
+  });
+
+  await checkAsync("F3 status all 新形状：sessions: N + 每会话 mode/text/rules", async () => {
+    writeFileSync(nudgesPath, JSON.stringify({ "me-1": { mode: "off", updatedAt: new Date().toISOString() } }), "utf8");
+    seedRules({ "me-1": [rule("r1", "A", ["every-message"]), rule("r2", "B", ["every-n"], { everyN: 2 })], "you-2": [rule("r3", "C", ["first-message"])] });
+    const ctx = makeCtx(Config(baseConfig));
+    const command = ctx.commands.find((definition) => definition.name === "vibe-nudge");
+    const out = await command.handler({ agent: { id: "me-1" }, rawInput: "status all" });
+    const lines = out.text.split("\n");
+    assert.equal(lines[0], "sessions: 2", "首行应是会话数");
+    assert.ok(lines.includes("  me-1: off text=no rules=2"), out.text);
+    assert.ok(lines.includes("  you-2: global text=no rules=1"), out.text);
+    assert.equal(out.text.includes("global:"), false, "不该再有全局节奏行");
   });
 
   await checkAsync("E4 真实 home 未被这轮用例写脏", async () => {
