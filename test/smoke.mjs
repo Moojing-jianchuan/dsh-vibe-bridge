@@ -1441,6 +1441,20 @@ const rulesCheck = async () => {
     assert.equal(text.split("[SYSTEM REMINDER:nudge]").length - 1, 1, "同轮合并成一段");
   });
 
+  await checkAsync("R3b 注入末尾带可执行指令（模型常把纯规则当背景资料）", async () => {
+    seedRules({ "session-r3b": [rule("x", "别用 print 调试", ["every-message"])] });
+    const withDirective = await textAt(makeCtx(Config(baseConfig)), "session-r3b", 1);
+    assert.match(withDirective, /→ 本轮回复前，先按上面每条规则自检一遍/, "注入末尾要有一句祈使指令");
+    // 指令必须在规则正文之后（离模型最近的那一行）
+    assert.ok(
+      withDirective.indexOf("→ 本轮回复前") > withDirective.indexOf("别用 print 调试"),
+      "指令要排在规则正文后面",
+    );
+    // 关掉就不加（排错时可以把注入还原成纯规则）
+    const withoutDirective = await textAt(makeCtx(Config({ ...baseConfig, reminderDirective: "" })), "session-r3b", 1);
+    assert.doesNotMatch(withoutDirective, /→ 本轮回复前/);
+  });
+
   await checkAsync("R4 规则全部 enabled:false → 零注入（没有全局兜底）", async () => {
     seedRules({ "session-r4": [rule("z", "停用的规则", ["every-message"], { enabled: false })] });
     const ctx = makeCtx(Config(baseConfig));
