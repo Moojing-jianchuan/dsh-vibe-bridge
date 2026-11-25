@@ -1412,6 +1412,136 @@ const nudgeTextCheck = async () => {
   console.log(results.slice(firstNew).join("\n"));
 };
 
+// ---------------------------------------------------------------------------
+// D：tester 报的四个缺陷（只有 text 的条目 / clear 语义 / status 形状 / 连点两次）
+// ---------------------------------------------------------------------------
+const defectCheck = async () => {
+  const firstNew = results.length;
+  const nudgesPath = path.join(TEST_HOME, "vibe-bridge", "nudges.json");
+  const baseConfig = {
+    enabled: true,
+    provider: "spawn",
+    persistWakeState: false,
+    rules: [],
+    nudgeText: "GLOBAL-D",
+    everyTurns: 2,
+    fullEveryTurns: 4,
+    speakOnFirstSeen: false,
+  };
+  const state = () => JSON.parse(readFileSync(nudgesPath, "utf8"));
+  const seed = (value) => writeFileSync(nudgesPath, JSON.stringify(value), "utf8");
+  const textAt = async (ctx, sessionId, turn) => {
+    const decision = await step(ctx.preStep[0], { turn, agent: { id: sessionId, session: { id: sessionId } } });
+    return decision.messages
+      .filter((message) => message.source?.kind === name)
+      .map((message) => message.content.map((part) => part.text).join(""))
+      .join("");
+  };
+
+  await checkAsync("D1 只有 text 的条目：status 通过自己的 output schema，mode 报 global + textCustom/textPreview", async () => {
+    seed({ "session-text-only": { text: "ONLY-TEXT", updatedAt: new Date().toISOString() } });
+    const ctx = makeCtx(Config(baseConfig));
+    const value = await ctx.tools.get("vibe_bridge_status").execute({}, { agent: { id: "runner" } });
+    // 拿工具自己声明的 output.schema 校验返回值（缺陷 1 就是这里会炸）
+    assertOutputContract(ctx.tools, "vibe_bridge_status", value);
+    const row = value.overrides.find((entry) => entry.sessionId === "session-text-only");
+    assert.ok(row !== undefined, "应列出该覆盖");
+    assert.equal(row.mode, "global", "没有 mode 的条目应报 global");
+    assert.equal(row.textCustom, true);
+    assert.equal(row.textPreview, "ONLY-TEXT");
+  });
+
+  await checkAsync("D2 状态矩阵：仅 text / 仅 mode / 两者，三种都能通过 schema", async () => {
+    seed({
+      "only-text": { text: "T1", updatedAt: new Date().toISOString() },
+      "only-mode": { mode: "every:2", updatedAt: new Date().toISOString() },
+      both: { mode: "off", text: "T2", updatedAt: new Date().toISOString() },
+    });
+    const ctx = makeCtx(Config(baseConfig));
+    const value = await ctx.tools.get("vibe_bridge_status").execute({}, { agent: { id: "runner" } });
+    assertOutputContract(ctx.tools, "vibe_bridge_status", value);
+    for (const row of value.overrides) {
+      assert.equal(typeof row.mode, "string", `${row.sessionId} 的 mode 必须是字符串`);
+      assert.equal(typeof row.textCustom, "boolean");
+      assert.equal(typeof row.textPreview, "string");
+    }
+    const both = value.overrides.find((entry) => entry.sessionId === "both");
+    assert.equal(both.mode, "off");
+    assert.equal(both.textPreview, "T2", "两者都有的条目应带文案预览");
+    const onlyMode = value.overrides.find((entry) => entry.sessionId === "only-mode");
+    assert.equal(onlyMode.textCustom, false);
+    assert.equal(onlyMode.textPreview, "");
+  });
+
+  await checkAsync("D3 clear 只清 mode 保留 text；purge 才整条删除", async () => {
+    seed({ "session-clear": { mode: "every:2", text: "PROBE_TEXT_SHOULD_SURVIVE", updatedAt: new Date().toISOString() } });
+    const ctx = makeCtx(Config(baseConfig));
+    const control = ctx.tools.get("nudge_control");
+    const cleared = await control.execute({ session_id: "session-clear", mode: "clear" }, {});
+    assert.equal(cleared.source, "global");
+    const afterClear = state()["session-clear"];
+    assert.equal(afterClear.text, "PROBE_TEXT_SHOULD_SURVIVE", "clear 不该丢文案");
+    assert.equal("mode" in afterClear, false, "clear 应删掉 mode 键");
+    // purge 才整条删除
+    await control.execute({ session_id: "session-clear", mode: "purge" }, {});
+    assert.equal(state()["session-clear"], undefined, "purge 应整条删除");
+  });
+
+  await checkAsync("D4 nudge_control 一次写 mode + text；text:\"\" 只清文案", async () => {
+    seed({});
+    const ctx = makeCtx(Config(baseConfig));
+    const control = ctx.tools.get("nudge_control");
+    const set = await control.execute({ session_id: "session-both", mode: "every:3", text: "BOTH-TEXT" }, {});
+    assert.equal(set.mode, "every:3");
+    const entry = state()["session-both"];
+    assert.equal(entry.mode, "every:3");
+    assert.equal(entry.text, "BOTH-TEXT");
+    await control.execute({ session_id: "session-both", mode: "every:3", text: "" }, {});
+    const clearedText = state()["session-both"];
+    assert.equal(clearedText.mode, "every:3", "清文案不该动 mode");
+    assert.equal("text" in clearedText, false);
+  });
+
+  await checkAsync("D5 无参切换两次：文案仍在、mode 缺失（不再整条删除）", async () => {
+    seed({ "session-toggle": { text: "KEEP-ME", updatedAt: new Date().toISOString() } });
+    const ctx = makeCtx(Config(baseConfig));
+    const command = ctx.commands.find((definition) => definition.name === "vibe-nudge");
+    await command.handler({ agent: { id: "session-toggle" }, rawInput: "" });
+    assert.equal(state()["session-toggle"].mode, "off", "第一次点击应关闭（保留文案）");
+    assert.equal(state()["session-toggle"].text, "KEEP-ME");
+    await command.handler({ agent: { id: "session-toggle" }, rawInput: "" });
+    const after = state()["session-toggle"];
+    assert.ok(after !== undefined, "第二次点击不该删掉条目");
+    assert.equal("mode" in after, false, "第二次点击应清掉 mode");
+    assert.equal(after.text, "KEEP-ME", "文案必须保留");
+  });
+
+  await checkAsync("D6 回归：既有三条数据（off / every:3+text / 仅 text）的 status 与注入都正确", async () => {
+    seed({
+      "session-a": { mode: "off", updatedAt: new Date().toISOString() },
+      "session-b": { mode: "every:3", text: "SESSION-B-TEXT", updatedAt: new Date().toISOString() },
+      "session-c": { text: "SESSION-C-TEXT", updatedAt: new Date().toISOString() },
+    });
+    const ctx = makeCtx(Config(baseConfig));
+    const value = await ctx.tools.get("vibe_bridge_status").execute({}, { agent: { id: "runner" } });
+    assertOutputContract(ctx.tools, "vibe_bridge_status", value);
+    const byId = (id) => value.overrides.find((entry) => entry.sessionId === id);
+    assert.equal(byId("session-a").mode, "off");
+    assert.equal(byId("session-a").textCustom, false);
+    assert.equal(byId("session-b").mode, "every:3");
+    assert.equal(byId("session-b").textPreview, "SESSION-B-TEXT");
+    assert.equal(byId("session-c").mode, "global", "只有文案的会话节奏仍是 global");
+    assert.equal(byId("session-c").textCustom, true);
+    // 注入：a 关闭、b 用自定义文案每 3 轮、c 用自定义文案按全局（every 2 → 第 1 轮命中）
+    assert.equal(await textAt(ctx, "session-a", 1), "");
+    assert.match(await textAt(ctx, "session-b", 1), /SESSION-B-TEXT/);
+    assert.match(await textAt(ctx, "session-c", 1), /SESSION-C-TEXT/);
+    assert.doesNotMatch(await textAt(ctx, "session-c", 1), /GLOBAL-D/);
+  });
+
+  console.log(results.slice(firstNew).join("\n"));
+};
+
 run()
   .then(wakeCheck)
   .then(deliveryCheck)
@@ -1419,6 +1549,7 @@ run()
   .then(scheduleCheck)
   .then(sessionNudgeCheck)
   .then(nudgeTextCheck)
+  .then(defectCheck)
   .then(() => {
     const failed = results.filter((line) => line.startsWith("FAIL"));
     console.log("");

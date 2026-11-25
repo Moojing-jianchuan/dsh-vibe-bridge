@@ -366,8 +366,9 @@ await check("弹窗：预填解析 session: 行（mode + 解码后的文案）",
   ctx.remote.commands.execute = original;
   assert.deepEqual(parsed, { mode: "off", text: "本会话文案" });
   const text = textOf(renderDialog());
-  assert.match(text, /生效：已关闭/);
-  assert.match(text, /文案：本会话文案/);
+  // 关闭但文案还在：文案必须被明说"已保留"，否则用户会以为丢了（缺陷 2/4 的观感）。
+  assert.match(text, /已关闭/);
+  assert.match(text, /自定义文案已保留/);
 });
 
 // ---------------------------------------------------------------------------

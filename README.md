@@ -137,8 +137,8 @@ Priority for every cadence field is **rule field > top-level scalar > built-in d
 | `query_session(session_id, tail?, include_tools?, verbose?)` | header + the last `tail` rounds, including an `[inject]` section for messages other sessions injected; `verbose` adds model/provider/workdir and longer excerpts |
 | `get_session_inbox(session_id)` | what is still queued in another session's inbox: `{position, target, source_kind, sender_session_id?, queued_at, preview}` |
 | `stop_session(session_id)` | interrupts a direct child only |
-| `nudge_control(session_id, mode)` | per-session nudge switch: `off` / `sparse` / `full` / `every:N` / `clear` (or `on` = clear); returns `{session_id, mode, source: 'session' \| 'global'}` and survives restarts |
-| `vibe_bridge_status()` | live status, rule list, injected count **and injected characters**, plus `overridesCount` and up to five `session → mode` overrides |
+| `nudge_control(session_id, mode, text?)` | per-session nudge switch: `off` / `sparse` / `full` / `every:N` / `clear` (or `on` = clear) / `purge`; `clear` drops only the **mode** and keeps this session's custom text, `purge` removes the whole entry; the optional `text` writes the custom text in the same call (`""` clears it); returns `{session_id, mode, source: 'session' \| 'global'}` and survives restarts |
+| `vibe_bridge_status()` | live status, rule list, injected count **and injected characters**, plus `overridesCount` and up to five entries `{sessionId, mode, textCustom, textPreview}` (`mode` is reported as `global` when a session only carries custom text) |
 
 The host command `/vibe-spawn <label>|<task>` backs the UI's *Create child session* action, so creating a child never costs a parent model turn.
 
@@ -360,13 +360,22 @@ stored `text` on disk, so re-enabling does not lose it. Child-done notices are u
 
 Three ways to set it — all of them land in the same file, so they survive a restart:
 
-- `nudge_control(session_id, mode)` (model tool),
-- `/vibe-nudge …` on the host: `off` | `on` | `sparse` | `full` | `every:N` | `clear` (no argument toggles
+- `nudge_control(session_id, mode, text?)` (model tool) — `text` writes the custom text in the same call,
+- `/vibe-nudge …` on the host: `off` | `on` | `sparse` | `full` | `every:N` | `clear` | `purge` (no argument toggles
   `off` ↔ global), `text:<base64>` to set this session's text (`text:` clears it), `status` for one session
   (`every … · global on|off` / `rules: …` / `overrides: …` plus a `session: mode=… text=<base64|empty>` line for
   pre-filling the dialog), and `status all` for the panel (`global: on|off · every N · full M · from K` + one
   `<id>: <mode> text=yes|no` line per overridden session),
 - the right-click 「碎碎念编辑」 dialog described above.
+
+`clear` and `purge` are deliberately different:
+
+| Command | Effect on `nudges.json` |
+|---|---|
+| `clear` (or `on`) | deletes **only `mode`**; a stored `text` survives, so re-enabling keeps the custom text. If nothing but `mode` was stored, the entry disappears (no empty shell). |
+| `purge` | deletes the whole entry, custom text included. |
+
+The dialog's 打开 button is `on` (= clear), so toggling off and on again never loses a session's text.
 
 The **global** switch (`nudgeEnabled`) is not part of `nudges.json`: it lives in the plugin config and is toggled
 through the settings form model (settings card, or the dialog's 全局 row). While it is `false` the plugin injects

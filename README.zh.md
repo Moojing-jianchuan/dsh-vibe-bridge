@@ -138,8 +138,8 @@ Windows 上依赖联接用的是目录 junction，不需要管理员权限、也
 | `query_session(session_id, tail?, include_tools?, verbose?)` | 头部信息 + 最近 `tail` 轮；新增 `[inject]` 段显示别的会话注入的消息；`verbose` 才给模型/供应商/工作目录与更长的正文 |
 | `get_session_inbox(session_id)` | 别的会话还没被消费的队列：`{position, target, source_kind, sender_session_id?, queued_at, preview}` |
 | `stop_session(session_id)` | 只停自己的直接子会话 |
-| `nudge_control(session_id, mode)` | 按会话开关碎碎念：`off` / `sparse` / `full` / `every:N` / `clear`（`on` = clear）；返回 `{session_id, mode, source: 'session' \| 'global'}`，重启后仍生效 |
-| `vibe_bridge_status()` | 在线状态、规则列表、已注入次数**与字符数**，外加 `overridesCount` 与最多五条 `会话 → mode` 覆盖 |
+| `nudge_control(session_id, mode, text?)` | 按会话开关碎碎念：`off` / `sparse` / `full` / `every:N` / `clear`（`on` = clear）/ `purge`；`clear` **只清节奏**、保留本会话文案，`purge` 整条删除；可选 `text` 一次写入本会话文案（`""` = 清空）；返回 `{session_id, mode, source: 'session' \| 'global'}`，重启后仍生效 |
+| `vibe_bridge_status()` | 在线状态、规则列表、已注入次数**与字符数**，外加 `overridesCount` 与最多五条 `{sessionId, mode, textCustom, textPreview}`（只有自定义文案的会话，`mode` 报 `global`） |
 
 宿主命令 `/vibe-spawn <名字>|<任务>` 就是界面里「创建子会话」背后的那条路径 —— 所以建子会话不消耗父会话的任何模型轮次。
 
@@ -295,9 +295,18 @@ a1f82c62-… [inactive] (top-level) — 重建工作区  ·  D:\ds_work  ·  --D
 
 三个入口写的是同一个文件，所以重启后依然生效：
 
-- `nudge_control(session_id, mode)`（模型工具）；
-- 宿主命令 `/vibe-nudge …`：`off` | `on` | `sparse` | `full` | `every:N` | `clear`（无参 = 在 `off` ↔ 全局之间切换），`text:<base64>` 设置本会话文案（`text:` 清空），`status` 给单个会话（`every … · global on|off` / `rules: …` / `overrides: …` 外加一行 `session: mode=… text=<base64|empty>` 供弹窗预填），`status all` 给面板（首行 `global: on|off · every N · full M · from K`，之后每个有覆盖的会话一行 `<id>: <mode> text=yes|no`）；
+- `nudge_control(session_id, mode, text?)`（模型工具）—— `text` 可以一次把文案也写进去；
+- 宿主命令 `/vibe-nudge …`：`off` | `on` | `sparse` | `full` | `every:N` | `clear` | `purge`（无参 = 在 `off` ↔ 全局之间切换），`text:<base64>` 设置本会话文案（`text:` 清空），`status` 给单个会话（`every … · global on|off` / `rules: …` / `overrides: …` 外加一行 `session: mode=… text=<base64|empty>` 供弹窗预填），`status all` 给面板（首行 `global: on|off · every N · full M · from K`，之后每个有覆盖的会话一行 `<id>: <mode> text=yes|no`）；
 - 右键「碎碎念编辑」弹窗（见上）。
+
+`clear` 与 `purge` 是刻意分开的：
+
+| 命令 | 对 `nudges.json` 的影响 |
+|---|---|
+| `clear`（或 `on`） | **只删 `mode`**；已存的自定义文案保留，重新开启不丢。若原本只有 `mode`、没有文案，则整条消失（不留空壳）。 |
+| `purge` | 整条删除，自定义文案一并丢弃。 |
+
+弹窗的「打开」就是 `on`（= clear），所以关一次再开回来不会丢文案。
 
 `nudges.json` 坏掉或读不到时一律当空表处理（只记一次 `warn`，**绝不**让 `agent/pre-step` 抛错），所以手改成坏文件也不会卡住一轮。
 
