@@ -68,8 +68,24 @@ const textOf = (message) => message.content.map((part) => part.text).join("");
 const stripPrefix = (text) => text.replace(/\((规则|约束|偏好|约定|反馈)\) /g, "");
 const GENERIC = "自检一遍";
 
+/** 真实 home 的 vibe-bridge 目录快照（文件名 + 大小）：用于"跑完测试后真实 home 不得新增文件"。 */
+const realHomeSnapshot = () => {
+  const dir = path.join(process.env.USERPROFILE ?? process.env.HOME ?? '', '.dsh', 'vibe-bridge')
+  try {
+    const { readdirSync, statSync } = require('node:fs')
+    return readdirSync(dir)
+      .sort()
+      .map((name) => `${name}:${statSync(path.join(dir, name)).size}`)
+      .join('|')
+  } catch {
+    return '(missing)'
+  }
+}
+const realHomeBefore = realHomeSnapshot()
+
 await check("C0 真实 home 未被写（临时 DSH_HOME 生效）", () => {
   assert.ok(HOME.includes("vb-compat-"), "DSH_HOME 应指向临时目录");
+  assert.equal(realHomeSnapshot(), realHomeBefore, "真实 home 的 vibe-bridge 目录在本套件运行期间不得变化");
 });
 
 // 前置：旧数据只在 nudges.json 里（无 rules.json）

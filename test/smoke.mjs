@@ -7,7 +7,7 @@
  * 运行：node test/smoke.mjs
  */
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import * as path from "node:path";
 import { zstdCompressSync } from "node:zlib";
@@ -1588,13 +1588,29 @@ const rulesCheck = async () => {
     assert.equal(list[0].content, "第二版文案");
     const cleared = await command.handler({ agent: { id: "session-alias" }, rawInput: "text:" });
     assert.equal(cleared.kind, "success");
-    assert.equal(JSON.parse(readFileSync(rulesPath, "utf8"))["session-alias"], undefined, "空 text: 清掉那一条（不留空内容规则）");
+    // 清空后该会话没有规则 → 整张表为空 → 文件应被删除（不是写成 {}）。
+    assert.equal(existsSync(rulesPath), false, "空 text: 清掉那一条后 rules.json 应不存在");
     assert.match(await textAt(ctx, "session-alias", 1), /GLOBAL-R/, "清空后回落旧路径");
   });
 
   await checkAsync("E4 真实 home 未被这轮用例写脏", async () => {
     assert.equal(snapshotFile(path.join(REAL_HOME, "vibe-bridge", "rules.json")), realHomeSnapshot.rules, "rules.json 不该被测试写到");
     assert.equal(snapshotFile(path.join(REAL_HOME, "vibe-bridge", "nudges.json")), realHomeSnapshot.nudges, "nudges.json 不该被测试写到");
+  });
+
+  await checkAsync("R8 空规则表不落盘：写一条再清空后 rules.json 应不存在", async () => {
+    writeFileSync(rulesPath, "{}", "utf8");
+    writeFileSync(nudgesPath, "{}", "utf8");
+    const ctx = makeCtx(Config(baseConfig));
+    const control = ctx.tools.get("nudge_control") ?? tools.get("nudge_control");
+    await control.execute(
+      { session_id: "session-empty", rules: [{ id: "r-1", type: "rule", content: "X", strategies: ["every-message"], enabled: true }] },
+      { agent: { id: "runner" } },
+    );
+    assert.equal(existsSync(rulesPath), true, "写入一条后文件应在");
+    await control.execute({ session_id: "session-empty", rules: [] }, { agent: { id: "runner" } });
+    // 文件"存在与否"是运维判断有没有走新路径的信号：空表必须删文件，不能留一个 {}。
+    assert.equal(existsSync(rulesPath), false, "清空后 rules.json 必须被删除（不是写成 {}）");
   });
 
   console.log(results.slice(firstNew).join("\n"));
