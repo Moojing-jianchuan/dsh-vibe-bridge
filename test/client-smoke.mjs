@@ -366,9 +366,9 @@ await check("弹窗：预填解析 session: 行（mode + 解码后的文案）",
   ctx.remote.commands.execute = original;
   assert.deepEqual(parsed, { mode: "off", text: "本会话文案" });
   const text = textOf(renderDialog());
-  // 关闭但文案还在：文案必须被明说"已保留"，否则用户会以为丢了（缺陷 2/4 的观感）。
-  assert.match(text, /已关闭/);
-  assert.match(text, /自定义文案已保留/);
+  // 暂停但旧文案还在：必须明说"文案没丢"，否则用户会以为丢了（缺陷 2/4 的观感）。
+  assert.match(text, /本会话已暂停注入/);
+  assert.match(text, /旧版会话文案仍按规则生效/);
 });
 
 // ---------------------------------------------------------------------------
@@ -699,6 +699,24 @@ await check("F1 切开关后列表仍在", async () => {
   assert.match(textOf(rendered), /已设置的规则（2）/, "切开关后列表条数不能变");
   const stored = ruleStore.get("session-abcdef1234");
   assert.equal(stored[0].enabled, false, "第一条应被停用并写回");
+});
+
+await check("弹窗：状态行按规则报本会话（不是“生效：全局”）", async () => {
+  const rules = [
+    { id: "r-a", type: "constraint", content: "A", strategies: ["every-message"], everyN: 3, enabled: true },
+    { id: "r-b", type: "preference", content: "B", strategies: ["every-n"], everyN: 3, enabled: false },
+  ];
+  menuFace.openNudgeEditor("session-abcdef1234", { rules });
+  // 打开时 mode 还是 unknown，走一次加载把状态补齐（真机是同一个 effect 做的）。
+  await nudgeFace.nudgeLoad("session-abcdef1234");
+  const text = textOf(renderDialog());
+  // 全局模型已删除：状态行只能描述本会话，否则用户会以为"全局又回来了"。
+  assert.match(text, /生效：2 条规则（1 条启用）/);
+  assert.equal(text.includes("生效：全局"), false, "不该再显示“生效：全局”");
+  // 没有规则时要说清不会注入
+  menuFace.openNudgeEditor("session-abcdef1234", { rules: [] });
+  await nudgeFace.nudgeLoad("session-abcdef1234");
+  assert.match(textOf(renderDialog()), /本会话未配置规则（不会注入）/);
 });
 
 console.log(results.join("\n"));
