@@ -751,4 +751,21 @@ await check("面板：每个会话行都有 复制 id / 碎碎念 / 建子会话
   assert.deepEqual(opened, ["child-aaaa-1111"], "碎碎念入口应打开该子会话");
 });
 
+await check("apply 暴露 __vibeBridge（侧栏子行按钮靠它调复制/碎碎念）", async () => {
+  const bridge = globalThis.__vibeBridge;
+  assert.ok(bridge !== undefined, "apply 后应挂上 globalThis.__vibeBridge");
+  assert.equal(typeof bridge.openNudgeEditor, "function");
+  assert.equal(typeof bridge.copyId, "function");
+  assert.ok(bridge.labels?.copy?.length > 0, "桥里要带文案，避免侧栏硬编码");
+  assert.ok(bridge.labels?.nudge?.length > 0);
+  // 复制走同一份实现
+  const written = [];
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { clipboard: { writeText: async (text) => void written.push(text) } },
+  });
+  await bridge.copyId("session-abcdef1234");
+  assert.deepEqual(written, ["session-abcdef1234"]);
+});
+
 console.log(results.join("\n"));
