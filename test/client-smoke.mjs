@@ -551,4 +551,45 @@ const RULES_FIXTURE = [
 
 /** 用最近一次的 props 重新渲染弹窗（模块级状态已经是新的了）。 */
 
+// ---------------------------------------------------------------------------
+// 回归守卫：这两类缺陷在真机上表现为"入口点了没反应"，纯函数渲染测不出来
+//   1) 组件引用了未定义的模块级状态仓（ReferenceError: dialog is not defined）
+//   2) 在 hook 之前早退（React #310: Rendered more hooks than during the previous render）
+// ---------------------------------------------------------------------------
+await check("弹窗状态仓都已定义（避免 ReferenceError）", () => {
+  for (const declaration of ["const dialog = {", "const setDialog =", "const subscribeDialog =", "const nudgeEditor ="]) {
+    assert.ok(source.includes(declaration), `lib/client.js 缺少声明：${declaration}`);
+  }
+});
+
+await check("弹窗组件在最后一个 hook 之前不早退（避免 React #310）", () => {
+  for (const component of ["VibeSpawnDialog", "NudgeEditorDialog"]) {
+    const start = source.indexOf(`function ${component}(`);
+    assert.ok(start >= 0, `找不到组件 ${component}`);
+    // 组件体的边界：下一个顶层 function 或下一个 #region，谁先到算谁；再兜底截前 8000 字。
+    const candidates = [source.indexOf("\n\t\tfunction ", start + 10), source.indexOf("\n\t\t//#region", start + 10)].filter(
+      (index) => index > start,
+    );
+    const end = Math.min(candidates.length === 0 ? source.length : Math.min(...candidates), start + 8000);
+    // 先剥掉注释：注释里出现的 "return null" 不算早退（我自己就踩过这个假阳性）。
+    const body = source
+      .slice(start, end)
+      .split("\n")
+      .filter((line) => !line.trim().startsWith("//") && !line.trim().startsWith("*"))
+      .join("\n");
+    const lastHook = Math.max(
+      body.lastIndexOf("react.useState("),
+      body.lastIndexOf("react.useEffect("),
+      body.lastIndexOf("react.useMemo("),
+      body.lastIndexOf("react.useRef("),
+    );
+    const firstEarlyReturn = body.indexOf("return null");
+    assert.ok(lastHook >= 0, `${component} 里没有 hook？`);
+    assert.ok(
+      firstEarlyReturn === -1 || firstEarlyReturn > lastHook,
+      `${component} 在 hook 之前 return null，会让 hook 数量在开/关之间变化（React #310）`,
+    );
+  }
+});
+
 console.log(results.join("\n"));
