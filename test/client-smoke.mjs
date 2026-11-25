@@ -137,6 +137,7 @@ const injectedSlots = [];
 const panels = [];
 const prompts = [];
 const commands = [];
+const ruleStore = new Map();
 const fakeForm = { value: { everyTurns: 4, fullEveryTurns: 12, fromTurn: 1, nudgeText: "" }, getSnapshot: () => fakeForm };
 const statusText = "every 4 · full every 12 · from turn 1\nrules: nudge every 4/full 12\noverrides: 2 (session-a → off, session-b → every:3)\nsession: mode=every:3 text=";
 const statusAllText = "sessions: 2\n  child-aaaa-1111: off text=no rules=0\n  child-bbbb-2222: global text=yes rules=2";
@@ -193,6 +194,18 @@ const ctx = {
         commands.push({ sessionId, line, attachments });
         if (line === "/vibe-nudge status all") return { ok: true, value: { result: { kind: "success", text: statusAllText } } };
         if (line === "/vibe-nudge status") return { ok: true, value: { result: { kind: "success", text: statusText } } };
+        // 规则：写入时存起来，读取时回真数组（否则保存后回读拿不到东西，
+        // 就测不出"开关后再渲染列表还在不在"这类真机问题）。
+        if (line.startsWith("/vibe-nudge rules:")) {
+          const decoded = JSON.parse(Buffer.from(line.slice("/vibe-nudge rules:".length), "base64").toString("utf8"));
+          ruleStore.set(sessionId, Array.isArray(decoded) ? decoded : []);
+          return { ok: true, value: { result: { kind: "success", text: "saved" } } };
+        }
+        if (line === "/vibe-nudge rules") {
+          const stored = ruleStore.get(sessionId) ?? [];
+          const encoded = Buffer.from(JSON.stringify(stored), "utf8").toString("base64");
+          return { ok: true, value: { result: { kind: "success", text: encoded } } };
+        }
         if (line.startsWith("/vibe-nudge")) return { ok: true, value: { result: { kind: "success", text: "ok" } } };
         return { ok: true, value: { result: { kind: "success", text: "session started: child-from-command" } } };
       },
@@ -658,6 +671,34 @@ await check("jsx 桩与 React 一致：第三个参数不会变成 children", ()
   // 若桩又把第三个参数并进 children，下面这类真实 bug 会重新变成"测试通过、真机空白"。
   const node = jsxRuntime.jsxs("div", { id: "x" }, ["child"]);
   assert.equal(node.props.children, undefined, "children 只能来自 props.children");
+});
+
+await check("nudgeSaveRules 必须回读并返回数组（否则切开关后弹窗崩）", async () => {
+  const rules = [
+    { id: "r-a", type: "constraint", content: "A 规则", strategies: ["every-message"], everyN: 3, enabled: true },
+  ];
+  ruleStore.set("session-abcdef1234", rules);
+  const saved = await nudgeFace.nudgeSaveRules("session-abcdef1234", rules);
+  // 真机症状：这里返回 undefined → 调用方 setNudgeEditor({rules: undefined}) → 下次渲染抛错 → 弹窗打不开。
+  assert.ok(Array.isArray(saved), `nudgeSaveRules 应返回数组，实际是 ${typeof saved}`);
+  assert.equal(saved.length, 1);
+});
+
+await check("F1 切开关后列表仍在", async () => {
+  const rules = [
+    { id: "r-a", type: "constraint", content: "A 规则", strategies: ["every-message"], everyN: 3, enabled: true },
+    { id: "r-b", type: "preference", content: "B 规则", strategies: ["every-n"], everyN: 3, enabled: true },
+  ];
+  ruleStore.set("session-abcdef1234", rules);
+  menuFace.openNudgeEditor("session-abcdef1234", { rules, rule: rules[0] });
+  const toggleBtn = find(renderDialog(), (node) => node.props?.["data-action"] === "rule-toggle");
+  assert.ok(toggleBtn !== undefined, "列表里应有开关");
+  toggleBtn.props.onClick();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const rendered = renderDialog();
+  assert.match(textOf(rendered), /已设置的规则（2）/, "切开关后列表条数不能变");
+  const stored = ruleStore.get("session-abcdef1234");
+  assert.equal(stored[0].enabled, false, "第一条应被停用并写回");
 });
 
 console.log(results.join("\n"));
